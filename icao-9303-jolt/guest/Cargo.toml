@@ -1,0 +1,14 @@
+[package]
+name = "guest"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+guest = []
+
+[dependencies]
+jolt      = { package = "jolt-sdk", git = "https://github.com/a16z/jolt", features = ["guest-std"] }
+icao-9303 = { path = "../..", default-features = false }
+cms       = { version = "0.2.3", features = ["std"] }
+der       = { version = "0.7.9", features = ["oid", "derive", "std"] }
+ruint     = "1.12.4"
