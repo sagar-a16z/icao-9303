@@ -1,3 +1,4 @@
+#[cfg(feature = "proxmark3")]
 mod proxmark3;
 
 use {crate::iso7816::StatusWord, anyhow::Result};
@@ -45,6 +46,12 @@ pub trait NfcReader {
     fn send_apdu(&mut self, apdu: &[u8]) -> Result<(StatusWord, Vec<u8>)>;
 }
 
+#[cfg(feature = "proxmark3")]
 pub fn connect_reader() -> Result<Box<dyn NfcReader>> {
     Ok(Box::new(proxmark3::Proxmark3::new()?))
+}
+
+#[cfg(not(feature = "proxmark3"))]
+pub fn connect_reader() -> Result<Box<dyn NfcReader>> {
+    anyhow::bail!("No NFC reader available (proxmark3 feature not enabled)")
 }
