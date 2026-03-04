@@ -19,7 +19,14 @@ where
     T: PrimInt + Unsigned + ConstantTimeEq,
 {
     fn bit_len(&self) -> usize {
-        T::zero().count_zeros() as usize
+        // With constant-time: always return the full type width so pow_ct
+        // iterates the same number of rounds regardless of exponent value.
+        // Without constant-time: return only the significant bits so pow_vt
+        // skips leading-zero iterations.
+        #[cfg(feature = "constant-time")]
+        return T::zero().count_zeros() as usize;
+        #[cfg(not(feature = "constant-time"))]
+        return (T::zero().count_zeros() - self.leading_zeros()) as usize;
     }
 
     fn bit_ct(&self, index: usize) -> Choice {

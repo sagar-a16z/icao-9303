@@ -63,7 +63,10 @@ impl<U: UintMont> RSAPublicKey<U> {
             "Unrecognized trailer field {trailer_field}. Expected value 1 (= 0xbc)"
         );
 
+        #[cfg(feature = "constant-time")]
         let em_elem = signature.pow_ct(self.public_exponent);
+        #[cfg(not(feature = "constant-time"))]
+        let em_elem = signature.pow_vt(self.public_exponent);
         let em_bytes = em_elem.to_uint().to_be_bytes();
         let em_len = (self.ring.modulus().bit_len() + 7) / 8;
 

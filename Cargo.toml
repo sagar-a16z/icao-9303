@@ -36,8 +36,9 @@ opt-level = 2
 opt-level = 3
 
 [features]
-default = ["proxmark3"]
+default = ["proxmark3", "constant-time"]
 proxmark3 = ["rusb"]
+constant-time = []
 
 [dependencies]
 aes = "0.8.4"

@@ -73,6 +73,25 @@ impl<Ring: RingRef> ModRingElement<Ring> {
         }
     }
 
+    /// Variable-time exponentiation with arbitrary unsigned int exponent.
+    ///
+    /// Faster than [`pow_ct`] when the exponent has few set bits (e.g.
+    /// e=65537 in RSA verification), but execution time depends on the
+    /// exponent value. Do not use when the exponent is secret.
+    #[must_use]
+    pub fn pow_vt<U: UintExp>(self, exponent: U) -> Self {
+        let mut result = self.ring.one();
+        let mut power = self;
+        for i in 0..exponent.bit_len() {
+            if bool::from(exponent.bit_ct(i)) {
+                result = result * power;
+            }
+            power *= power;
+        }
+        let value = result.value;
+        self.ring.from_montgomery(value)
+    }
+
     /// Constant-time exponentation with arbitrary unsigned int exponent.
     #[must_use]
     pub fn pow_ct<U: UintExp>(self, exponent: U) -> Self {
