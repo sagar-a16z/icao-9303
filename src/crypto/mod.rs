@@ -2,7 +2,9 @@
 //!
 //! Primarily based on TR-03111.
 
+pub mod certificate;
 mod codec;
+pub mod ecdsa;
 pub mod groups;
 pub mod mod_ring;
 pub mod rsa;
