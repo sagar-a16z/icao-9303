@@ -26,7 +26,7 @@ type Uint2048 = Uint<2048, 32>;
 /// 1. The EF.SOD carries a valid RSA-PSS-SHA256 signature (DS cert signed
 ///    the LdsSecurityObject).
 /// 2. Every data group on chip hashes to the value committed in the SOD.
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x8000000)]
+#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x800000)]
 fn verify_sod() -> bool {
     // ── 1. Parse EF.SOD ───────────────────────────────────────────────────
     start_cycle_tracking("parse_sod");
