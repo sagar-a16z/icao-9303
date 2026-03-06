@@ -72,6 +72,7 @@ subtle = "2.6.1"
 thiserror = "1.0.64"
 trace = "0.1.7"
 tracing = "0.1.41"
+x509-cert = "0.2.5"
 
 [target.'cfg(not(lib))'.dependencies]
 argh = "0.1.12"
