@@ -610,6 +610,7 @@ dependencies = [
  "glob",
  "hex",
  "hex-literal",
+ "jolt-inlines-sha2",
  "num-traits",
  "num_enum",
  "rand",
@@ -680,6 +681,11 @@ name = "itoa"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d75a2a4b1b190afb6f5425f10f6a8f959d2ea0b9c2b1d79553551850539e4674"
+
+[[package]]
+name = "jolt-inlines-sha2"
+version = "0.1.0"
+source = "git+https://github.com/a16z/jolt#97b2c96fe06826d7e607797e5892be3020044108"
 
 [[package]]
 name = "lazy_static"

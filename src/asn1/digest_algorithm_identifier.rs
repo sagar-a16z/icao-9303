@@ -90,6 +90,9 @@ impl DigestAlgorithmIdentifier {
     pub fn hash_bytes(&self, data: &[u8]) -> Vec<u8> {
         match self {
             Self::Sha1(_) => hash::<sha1::Sha1>(data),
+            #[cfg(feature = "jolt-sha2")]
+            Self::Sha256(_) => jolt_inlines_sha2::Sha256::digest(data).to_vec(),
+            #[cfg(not(feature = "jolt-sha2"))]
             Self::Sha256(_) => hash::<sha2::Sha256>(data),
             Self::Sha384(_) => hash::<sha2::Sha384>(data),
             Self::Sha512(_) => hash::<sha2::Sha512>(data),
