@@ -12,3 +12,4 @@ icao-9303 = { path = "../..", default-features = false, features = ["jolt-sha2"]
 cms       = { version = "0.2.3", features = ["std"] }
 der       = { version = "0.7.9", features = ["oid", "derive", "std"] }
 ruint     = "1.12.4"
+serde     = { version = "1", features = ["derive"] }

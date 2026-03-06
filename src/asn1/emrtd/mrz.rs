@@ -5,6 +5,50 @@
 
 use anyhow::{anyhow, ensure, Result};
 
+/// Raw MRZ fields as fixed-size byte arrays.
+/// Suitable for ZK guest contexts where String allocation is expensive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MrzRaw {
+    pub document_type: [u8; 2],
+    pub issuing_state: [u8; 3],
+    pub nationality: [u8; 3],
+    pub date_of_birth: [u8; 6],
+    pub sex: u8,
+    pub expiry_date: [u8; 6],
+    pub document_number: [u8; 9],
+}
+
+impl MrzRaw {
+    /// Parse from raw EF.DG1 bytes into fixed-size arrays.
+    pub fn from_dg1(dg1: &[u8]) -> Result<Self> {
+        ensure!(!dg1.is_empty() && dg1[0] == 0x61, "Invalid DG1 tag");
+        let (outer_len, outer_skip) = parse_length(dg1, 1)?;
+        let content = &dg1[1 + outer_skip..1 + outer_skip + outer_len];
+        ensure!(content.len() >= 2 && content[0] == 0x5F && content[1] == 0x1F, "Expected 0x5F1F");
+        let (mrz_len, mrz_skip) = parse_length(content, 2)?;
+        Self::from_td3_bytes(&content[2 + mrz_skip..2 + mrz_skip + mrz_len])
+    }
+
+    /// Parse from raw 88-byte TD3 MRZ data.
+    pub fn from_td3_bytes(mrz: &[u8]) -> Result<Self> {
+        ensure!(mrz.len() == 88, "TD3 MRZ must be 88 bytes, got {}", mrz.len());
+        let mut document_type = [0u8; 2];
+        document_type.copy_from_slice(&mrz[0..2]);
+        let mut issuing_state = [0u8; 3];
+        issuing_state.copy_from_slice(&mrz[2..5]);
+        let mut document_number = [0u8; 9];
+        document_number.copy_from_slice(&mrz[44..53]);
+        let mut nationality = [0u8; 3];
+        nationality.copy_from_slice(&mrz[54..57]);
+        let mut date_of_birth = [0u8; 6];
+        date_of_birth.copy_from_slice(&mrz[57..63]);
+        let sex = mrz[64];
+        let mut expiry_date = [0u8; 6];
+        expiry_date.copy_from_slice(&mrz[65..71]);
+        Ok(Self { document_type, issuing_state, nationality, date_of_birth, sex, expiry_date, document_number })
+    }
+}
+
 /// Parsed TD3 Machine Readable Zone from EF.DG1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mrz {

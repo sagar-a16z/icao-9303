@@ -119,3 +119,24 @@ fn test_rsa_pss_verify_manual() -> Result<()> {
     rsa_key.verify(msg_elem, sig_elem, &sig_algo)?;
     Ok(())
 }
+
+/// Verify the DS certificate was signed by the CSCA (step 3 of Passive Authentication).
+/// Skips gracefully if CSCA.cer is not present in the test dataset.
+#[test]
+fn test_verify_ds_cert_by_csca() -> Result<()> {
+    let d = Dataset::load()?;
+    let csca_der = match &d.csca {
+        Some(c) => c,
+        None => {
+            println!("Skipping — CSCA.cer not found in tests/dataset/");
+            return Ok(());
+        }
+    };
+
+    let csca = x509_cert::Certificate::from_der(csca_der)?;
+    let sod = EfSod::from_der(&d.sod)?;
+    let ds = icao_9303::crypto::certificate::ds_cert_from_sod(&sod)?;
+
+    icao_9303::crypto::certificate::verify_cert_signature(&ds, &csca)?;
+    Ok(())
+}

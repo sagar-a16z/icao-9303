@@ -19,6 +19,7 @@ pub struct Dataset {
     pub sod:       Vec<u8>,
     pub dg14_keys: Keypair,
     pub dg15_keys: Keypair,
+    pub csca:      Option<Vec<u8>>,
 }
 
 /// Public-private key pair.
@@ -47,6 +48,8 @@ impl Dataset {
             sk: Self::read_binfile("tests/dataset/DG15_sk.pkcs8")?,
         };
 
+        let csca = Self::read_binfile("tests/dataset/CSCA.cer").ok();
+
         Ok(Self {
             dg1,
             dg2,
@@ -58,6 +61,7 @@ impl Dataset {
             sod,
             dg14_keys,
             dg15_keys,
+            csca,
         })
     }
 
