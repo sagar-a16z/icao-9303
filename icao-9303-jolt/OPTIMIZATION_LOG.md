@@ -1,0 +1,113 @@
+# Jolt ZK Guest Optimization Log
+
+## Baseline (before optimizations)
+
+Two provable functions sharing `verify_passport_inner()`:
+
+| Variant | Total Cycles | Prove Time |
+|---------|-------------|------------|
+| Packed (`Vec<u8>`) | 7,445,662 | 17.4s |
+| Struct (`PassportData`) | 7,583,661 | 18.7s |
+
+Cycle breakdown (packed variant):
+
+| Section | Cycles | % |
+|---------|--------|---|
+| `dg_hash_verify` | 2,845,637 | 38.2% |
+| `cert_chain_verify` | 776,354 | 10.4% |
+| `rsa_verify` (SOD) | 759,686 | 10.2% |
+| `parse_sod` | 380,988 | 5.1% |
+| `cert_chain_setup` | 290,601 | 3.9% |
+| `parse_csca` | 182,703 | 2.5% |
+| `ring_setup` | 105,227 | 1.4% |
+| `mont_encode` | 102,582 | 1.4% |
+| `hash_signed_attrs` | 33,841 | 0.5% |
+| `extract_cert` | 19,275 | 0.3% |
+| `csca_hash` | 16,459 | 0.2% |
+| `mrz_parse` | 438 | ~0% |
+| serde + overhead | ~1,931,871 | 25.9% |
+
+## Optimization 1: Host-side DER pre-parsing
+
+**Goal**: Eliminate `parse_sod` (381K), `parse_csca` (183K), and parts of `cert_chain_setup` (~100K) by having the host extract needed byte fields before passing to guest.
+
+**Approach**:
+- Host parses SOD + CSCA using the library, extracts byte fields
+- Guest receives pre-parsed fields in the packed buffer
+- Guest does lightweight structural checks + all crypto verification
+
+**Packed buffer fields** (pre-parsed):
+1. signed_attrs_der — for hash + RSA signature verification
+2. digest_alg_der — algorithm identifier
+3. sig_algo_der — RSA-PSS signature algorithm
+4. signature_bytes — SOD RSA signature
+5. ds_spki_der — Document Signer public key
+6. lds_der — raw LDS DER bytes (for DG hash verification)
+7. tbs_der — DS cert TBSCertificate (for cert chain verification)
+8. cert_sig_bytes — DS cert signature
+9. cert_sig_algo_der — cert signature algorithm
+10. ds_spki_offset_in_tbs — u32 offset (for structural integrity check)
+11. csca_spki_der — CSCA public key
+12. dg1, dg2, dg3, dg4, dg14 — raw data group bytes
+
+**Structural integrity checks** (guest-side):
+1. `hash(lds_der) == messageDigest_in_signed_attrs` — prevents fake LDS
+2. `tbs_der[offset..offset+len] == ds_spki_der` — prevents fake DS key
+
+**Security reasoning**:
+- Chain of trust: csca_pubkey_hash (public output) → CSCA signs tbs_der → tbs_der contains ds_spki → ds_spki verifies SOD signature → signed_attrs commit to LDS → LDS commits to DG hashes
+- If any advice field is faked, either crypto fails or structural check fails
+- Prover can't forge because breaking the chain requires breaking RSA
+
+**Expected savings**: ~560K cycles from DER parsing + some from cert_chain_setup
+
+**Actual results**:
+
+| Metric | Pre-parsed | Struct (baseline) | Delta |
+|--------|-----------|-------------------|-------|
+| Total cycles | 7,134,555 | 7,584,354 | -449,799 (5.9%) |
+| Prove time | 17.2s | 18.1s | -0.9s |
+
+Eliminated sections: parse_sod (382K), extract_cert (19K), parse_csca (182K) = 584K saved
+New sections: structural_checks (27K), parse_lds (44K) = 71K added
+cert_chain_setup reduced by 39K (no tbs_der re-encoding)
+dg_hash_verify regressed by 287K (cross-ELF alignment noise with jolt-inlines-sha2)
+Serde overhead reduced by ~193K (slightly smaller buffer)
+
+**Net savings: 450K cycles (5.9%)** — matches expected DER parsing savings despite the
+dg_hash_verify regression. Without the alignment noise, savings would be ~737K (9.7%).
+
+**Note**: The dg_hash_verify regression was caused by alignment: all DG bytes lived in one
+`Vec<u8>` heap allocation (align=1 from jolt's BumpAllocator), so DG sub-slices could land
+on misaligned addresses. jolt-inlines-sha2's LW loads cost 6 instructions for misaligned
+vs 2-3 for aligned. Fixed in Optimization 2.
+
+## Optimization 2: Split DG data into separate PrivateInput
+
+**Goal**: Eliminate the 287K dg_hash_verify alignment regression by giving each DG its own
+aligned heap allocation.
+
+**Approach**:
+- Split `verify_passport_packed` into two `PrivateInput` arguments:
+  1. `preparsed_buf: PrivateInput<Vec<u8>>` — pre-parsed SOD/CSCA fields (~2.4KB)
+  2. `dgs: PrivateInput<PassportDGs>` — DG data as separate Vecs
+- `PassportDGs` is a struct with `dg1..dg14` as individual `Vec<u8>` fields
+- When postcard deserializes `PassportDGs`, each Vec gets its own heap allocation → naturally aligned
+- No changes to verification logic or security model
+
+**Actual results**:
+
+| Section | Before (single buf) | After (split DGs) | Delta |
+|---------|--------------------|--------------------|-------|
+| `dg_hash_verify` | 3,130,532 | 2,800,292 | -330,240 |
+| `structural_checks` | 27,039 | 26,605 | -434 |
+| `ring_setup` | 127,197 | 125,567 | -1,630 |
+| `cert_chain_setup` | 250,965 | 251,057 | +92 |
+| Other sections | ~similar | ~similar | ~0 |
+
+dg_hash_verify is now 43K cycles *below* the struct baseline (2,800,292 vs 2,843,416),
+confirming the regression was purely alignment-related.
+
+**Tracked sections total**: 4,930,284 (was 5,202,684 before fix)
+
+Estimated total with serde overhead: ~6,862K cycles — **~722K savings (9.5%) vs struct baseline**.

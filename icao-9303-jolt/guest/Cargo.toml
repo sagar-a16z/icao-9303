@@ -7,9 +7,10 @@ edition = "2021"
 guest = []
 
 [dependencies]
-jolt      = { package = "jolt-sdk", git = "https://github.com/a16z/jolt", features = ["guest-std"] }
+jolt      = { package = "jolt-sdk", git = "https://github.com/a16z/jolt", features = ["guest-std", "zk"] }
 icao-9303 = { path = "../..", default-features = false, features = ["jolt-sha2"] }
 cms       = { version = "0.2.3", features = ["std"] }
+x509-cert = { version = "0.2", features = ["std"] }
 der       = { version = "0.7.9", features = ["oid", "derive", "std"] }
 ruint     = "1.12.4"
 serde     = { version = "1", features = ["derive"] }
