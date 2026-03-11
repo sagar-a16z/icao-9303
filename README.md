@@ -26,6 +26,16 @@ Not implemented yet:
 Not planned:
  * Terminal Authentication
 
+## Test Data
+
+The `tests/dataset/` directory contains DG binaries from the BSI TR-03105-5 reference dataset. To run the full Jolt ZK proof (which needs a matching CSCA + SOD), generate a synthetic dataset:
+
+```bash
+./tests/gen-synthetic-dataset.sh
+```
+
+This creates `tests/dataset-synth/` with a synthetic CSCA certificate, DS certificate, and CMS-signed EF_SOD.bin that commits to the BSI DG hashes. Requires OpenSSL 3.x and Python 3. The output is gitignored since it contains freshly generated RSA keys.
+
 ## References
 
 * ICAO 9303: Machine Readable Travel Documents.
