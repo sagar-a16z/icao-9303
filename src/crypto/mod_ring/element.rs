@@ -86,6 +86,8 @@ impl<Ring: RingRef> ModRingElement<Ring> {
             if bool::from(exponent.bit_ct(i)) {
                 result = result * power;
             }
+            // Note: `*= power` uses mont_mul which is faster than mont_square
+            // on RISC-V (no hardware carry flag makes double-mul-add slower).
             power *= power;
         }
         let value = result.value;
@@ -102,6 +104,8 @@ impl<Ring: RingRef> ModRingElement<Ring> {
         for i in 0..exponent.bit_len() {
             let product = result * power;
             result.conditional_assign(&product, exponent.bit_ct(i));
+            // Note: `*= power` uses mont_mul which is faster than mont_square
+            // on RISC-V (no hardware carry flag makes double-mul-add slower).
             power *= power;
         }
         let value = result.value;
@@ -316,6 +320,7 @@ where
     }
 }
 
+#[cfg(feature = "constant-time")]
 impl<Ring: RingRef, U: UintExp> Pow<U> for ModRingElement<Ring>
 where
     Ring::Uint: ConditionallySelectable,
@@ -327,9 +332,19 @@ where
     }
 }
 
+#[cfg(not(feature = "constant-time"))]
+impl<Ring: RingRef, U: UintExp> Pow<U> for ModRingElement<Ring> {
+    type Output = Self;
+
+    fn pow(self, rhs: U) -> Self::Output {
+        self.pow_vt(rhs)
+    }
+}
+
 // Mixed ring power operations.
 // Realy only useful if RingB is a subgroup of the multiplicative group of
 // RingA.
+#[cfg(feature = "constant-time")]
 impl<RingA: RingRef, RingB: RingRef> Pow<ModRingElement<RingB>> for ModRingElement<RingA>
 where
     RingA::Uint: ConditionallySelectable,
@@ -339,5 +354,17 @@ where
 
     fn pow(self, rhs: ModRingElement<RingB>) -> Self::Output {
         self.pow_ct(rhs.to_uint())
+    }
+}
+
+#[cfg(not(feature = "constant-time"))]
+impl<RingA: RingRef, RingB: RingRef> Pow<ModRingElement<RingB>> for ModRingElement<RingA>
+where
+    RingB::Uint: UintExp,
+{
+    type Output = Self;
+
+    fn pow(self, rhs: ModRingElement<RingB>) -> Self::Output {
+        self.pow_vt(rhs.to_uint())
     }
 }

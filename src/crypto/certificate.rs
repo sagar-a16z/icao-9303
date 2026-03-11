@@ -7,7 +7,6 @@ use {
     crate::{
         asn1::{
             public_key_info::SubjectPublicKeyInfo,
-            DigestAlgorithmIdentifier,
             SignatureAlgorithmIdentifier,
         },
         crypto::{mod_ring::RingRefExt, rsa::RSAPublicKey},
@@ -18,6 +17,8 @@ use {
 };
 
 type Uint2048 = Uint<2048, 32>;
+type Uint3072 = Uint<3072, 48>;
+type Uint4096 = Uint<4096, 64>;
 
 /// Verify that `cert` was signed by `issuer_cert`.
 ///
@@ -25,8 +26,7 @@ type Uint2048 = Uint<2048, 32>;
 /// hash the TBS (to-be-signed) portion of `cert` and verify the
 /// signature using the public key from `issuer_cert`.
 ///
-/// Currently supports RSA-PSS only. Returns an error for EC-signed
-/// certificates (many modern passports) until ECDSA is implemented.
+/// Supports RSA-PSS with 2048, 3072, and 4096-bit keys.
 pub fn verify_cert_signature(
     cert: &x509_cert::Certificate,
     issuer_cert: &x509_cert::Certificate,
@@ -51,19 +51,35 @@ pub fn verify_cert_signature(
 
     let message_hash = digest_algo.hash_bytes(&tbs_der);
 
-    // ── 3. Verify with issuer's RSA key ────────────────────────────────────
-    let rsa_key = RSAPublicKey::<Uint2048>::try_from(issuer_spki)?;
-
     let sig_bytes = cert
         .signature
         .as_bytes()
         .ok_or_else(|| anyhow::anyhow!("Certificate signature is not a bit string"))?;
 
-    let sig_elem = rsa_key.ring.from(Uint2048::from_be_slice(sig_bytes));
-    let msg_elem = rsa_key.ring.from(Uint2048::from_be_slice(&message_hash));
+    // ── 3. Dispatch by signature byte length (= modulus size in bytes) ────
+    let sig_bit_len = sig_bytes.len() * 8;
 
-    rsa_key.verify(msg_elem, sig_elem, &sig_algo)?;
+    match sig_bit_len {
+        ..=2048 => verify_rsa_cert::<2048, 32>(issuer_spki, sig_bytes, &message_hash, &sig_algo),
+        ..=3072 => verify_rsa_cert::<3072, 48>(issuer_spki, sig_bytes, &message_hash, &sig_algo),
+        ..=4096 => verify_rsa_cert::<4096, 64>(issuer_spki, sig_bytes, &message_hash, &sig_algo),
+        _ => bail!("RSA signature too large: {sig_bit_len} bits"),
+    }
+}
 
+fn verify_rsa_cert<const B: usize, const L: usize>(
+    issuer_spki: SubjectPublicKeyInfo,
+    sig_bytes: &[u8],
+    message_hash: &[u8],
+    sig_algo: &SignatureAlgorithmIdentifier,
+) -> Result<()>
+where
+    Uint<B, L>: ruint::UintTryFrom<u64>,
+{
+    let rsa_key = RSAPublicKey::<Uint<B, L>>::try_from(issuer_spki)?;
+    let sig_elem = rsa_key.ring.from(Uint::<B, L>::from_be_slice(sig_bytes));
+    let msg_elem = rsa_key.ring.from(Uint::<B, L>::from_be_slice(message_hash));
+    rsa_key.verify(msg_elem, sig_elem, sig_algo)?;
     Ok(())
 }
 
@@ -97,6 +113,68 @@ mod tests {
         println!("DS Issuer:   {}", ds.tbs_certificate.issuer);
 
         assert!(!ds.tbs_certificate.subject.to_string().is_empty());
+        Ok(())
+    }
+
+    /// MY dataset: full Passive Authentication steps 1 + 3.
+    /// Step 1: SOD signature verification (DS cert signs LdsSecurityObject)
+    /// Step 3: DS cert was signed by 3072-bit CSCA
+    #[test]
+    fn test_my_full_passive_auth() -> anyhow::Result<()> {
+        let csca_der = std::fs::read("tests/dataset-my/CSCA.cer")?;
+        let sod_bytes = std::fs::read("tests/dataset-my/EF_SOD.bin")?;
+
+        // Step 1: verify SOD signature
+        let sod = crate::asn1::emrtd::EfSod::from_der(&sod_bytes)?;
+        sod.verify_signature()?;
+        println!("Step 1 OK: SOD signature valid");
+
+        // Step 3: verify DS cert chains to CSCA
+        let csca = x509_cert::Certificate::from_der(&csca_der)?;
+        let ds = ds_cert_from_sod(&sod)?;
+
+        println!("CSCA: {}", csca.tbs_certificate.subject);
+        println!("DS:   {}", ds.tbs_certificate.subject);
+
+        verify_cert_signature(&ds, &csca)?;
+        println!("Step 3 OK: DS cert signed by CSCA");
+
+        Ok(())
+    }
+
+    /// Synthetic dataset: full Passive Authentication steps 1 + 2 + 3.
+    /// Uses BSI DG files with a synthetic CSCA + DS + SOD.
+    #[test]
+    fn test_synthetic_full_passive_auth() -> anyhow::Result<()> {
+        let csca_der = std::fs::read("tests/dataset-synth/CSCA.cer")?;
+        let sod_bytes = std::fs::read("tests/dataset-synth/EF_SOD.bin")?;
+
+        // Step 1: verify SOD signature (DS cert signs LdsSecurityObject)
+        let sod = crate::asn1::emrtd::EfSod::from_der(&sod_bytes)?;
+        sod.verify_signature()?;
+        println!("Step 1 OK: SOD signature valid");
+
+        // Step 2: verify DG hashes match SOD commitments
+        let dg1 = std::fs::read("tests/dataset/Datagroup1.bin")?;
+        let dg2 = std::fs::read("tests/dataset/Datagroup2.bin")?;
+        let dg3 = std::fs::read("tests/dataset/Datagroup3.bin")?;
+        let dg4 = std::fs::read("tests/dataset/Datagroup4.bin")?;
+        let dg14 = std::fs::read("tests/dataset/Datagroup14.bin")?;
+        sod.verify_dg_hashes(&[
+            (1, &dg1), (2, &dg2), (3, &dg3), (4, &dg4), (14, &dg14),
+        ])?;
+        println!("Step 2 OK: DG hashes match SOD commitments");
+
+        // Step 3: verify DS cert chains to CSCA
+        let csca = x509_cert::Certificate::from_der(&csca_der)?;
+        let ds = ds_cert_from_sod(&sod)?;
+
+        println!("CSCA: {}", csca.tbs_certificate.subject);
+        println!("DS:   {}", ds.tbs_certificate.subject);
+
+        verify_cert_signature(&ds, &csca)?;
+        println!("Step 3 OK: DS cert signed by CSCA");
+
         Ok(())
     }
 }
