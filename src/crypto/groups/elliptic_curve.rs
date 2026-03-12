@@ -163,6 +163,103 @@ impl<U: UintMont> EllipticCurve<U> {
         }
     }
 
+    /// Shamir's trick: compute k1*P1 + k2*P2 in a single pass.
+    ///
+    /// Instead of two separate scalar multiplications (512 doublings + ~256
+    /// additions), this scans both scalars MSB-to-LSB simultaneously: 256
+    /// doublings + ~192 additions. Uses Jacobian-affine mixed addition for
+    /// table lookups (precomputed points are affine, saving ~4 field muls
+    /// per addition vs full Jacobian-Jacobian).
+    pub fn double_scalar_mul<'a, W: UintExp>(
+        &'a self,
+        k1: W, p1: EllipticCurvePoint<'a, U>,
+        k2: W, p2: EllipticCurvePoint<'a, U>,
+    ) -> EllipticCurvePoint<'a, U> {
+        let (p1x, p1y) = match p1.coordinates {
+            Coordinates::Infinity => return p2.mul_uint(k2),
+            Coordinates::Affine(x, y) => (x, y),
+        };
+        let (p2x, p2y) = match p2.coordinates {
+            Coordinates::Infinity => return p1.mul_uint(k1),
+            Coordinates::Affine(x, y) => (x, y),
+        };
+
+        let field = &self.base_field;
+        let a = self.a();
+        let c2 = field.from_u64(2);
+        let c4 = field.from_u64(4);
+        let c8 = field.from_u64(8);
+
+        // Precompute P1 + P2 in affine (one field inversion)
+        let p12 = p1 + p2;
+        let (p12x, p12y) = match p12.coordinates {
+            Coordinates::Infinity => {
+                // P1 = -P2; fall back to separate scalar muls
+                return p1.mul_uint(k1) + p2.mul_uint(k2);
+            }
+            Coordinates::Affine(x, y) => (x, y),
+        };
+
+        // Accumulator in Jacobian coordinates
+        let mut rx = field.zero();
+        let mut ry = field.one();
+        let mut rz = field.zero();
+        let mut r_inf = true;
+
+        let max_bit = k1.bit_len().max(k2.bit_len());
+
+        // MSB-to-LSB scan of both scalars simultaneously
+        for i in (0..max_bit).rev() {
+            // Double the accumulator
+            if !r_inf {
+                let (nx, ny, nz) = jac_double(rx, ry, rz, a, c2, c4, c8);
+                rx = nx; ry = ny; rz = nz;
+            }
+
+            let b1 = bool::from(k1.bit_ct(i));
+            let b2 = bool::from(k2.bit_ct(i));
+
+            // Select table entry: 00=skip, 01=P1, 10=P2, 11=P1+P2
+            let (tx, ty) = match (b1, b2) {
+                (false, false) => continue,
+                (true, false) => (p1x, p1y),
+                (false, true) => (p2x, p2y),
+                (true, true) => (p12x, p12y),
+            };
+
+            if r_inf {
+                rx = tx;
+                ry = ty;
+                rz = field.one();
+                r_inf = false;
+            } else {
+                // Mixed Jacobian-affine addition (table points are affine)
+                let (nx, ny, nz, is_inf) = jac_add_mixed(rx, ry, rz, tx, ty, a, c2, c4, c8);
+                if is_inf {
+                    r_inf = true;
+                } else {
+                    rx = nx; ry = ny; rz = nz;
+                }
+            }
+        }
+
+        if r_inf {
+            return self.infinity();
+        }
+
+        // Jacobian → Affine: x = X/Z², y = Y/Z³
+        let z_inv = rz.inv().expect("Z should be nonzero for non-infinity point");
+        let z_inv2 = z_inv * z_inv;
+        let z_inv3 = z_inv2 * z_inv;
+        let ax = rx * z_inv2;
+        let ay = ry * z_inv3;
+
+        EllipticCurvePoint {
+            curve: self,
+            coordinates: Coordinates::Affine(ax, ay),
+        }
+    }
+
     fn ensure_valid<'a>(
         &'a self,
         x: ModRingElementRef<'a, U>,
@@ -189,6 +286,109 @@ impl<U: UintMont> EllipticCurve<U> {
         }
         Ok(())
     }
+}
+
+// ── Jacobian projective coordinate helpers ───────────────────────────────────
+// Extracted as module-level functions shared by mul_uint and double_scalar_mul.
+
+/// Jacobian doubling: (X1,Y1,Z1) -> (X3,Y3,Z3)
+/// https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian.html#doubling-dbl-2007-bl
+#[inline(always)]
+fn jac_double<'a, U: UintMont>(
+    x1: ModRingElementRef<'a, U>, y1: ModRingElementRef<'a, U>, z1: ModRingElementRef<'a, U>,
+    a: ModRingElementRef<'a, U>,
+    c2: ModRingElementRef<'a, U>, c4: ModRingElementRef<'a, U>, c8: ModRingElementRef<'a, U>,
+) -> (ModRingElementRef<'a, U>, ModRingElementRef<'a, U>, ModRingElementRef<'a, U>) {
+    let _ = c4;
+    let xx = x1 * x1;
+    let yy = y1 * y1;
+    let yyyy = yy * yy;
+    let zz = z1 * z1;
+    let s = c2 * ((x1 + yy) * (x1 + yy) - xx - yyyy);
+    let m = c2 * xx + xx + a * (zz * zz); // 3*XX + a*ZZ²
+    let t = m * m - c2 * s;
+    let x3 = t;
+    let y3 = m * (s - t) - c8 * yyyy;
+    let z3 = (y1 + z1) * (y1 + z1) - yy - zz;
+    (x3, y3, z3)
+}
+
+/// Jacobian addition: (X1,Y1,Z1) + (X2,Y2,Z2) -> (X3,Y3,Z3)
+/// https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian.html#addition-add-2007-bl
+/// Returns (X3, Y3, Z3, is_infinity).
+#[inline(always)]
+fn jac_add<'a, U: UintMont>(
+    x1: ModRingElementRef<'a, U>, y1: ModRingElementRef<'a, U>, z1: ModRingElementRef<'a, U>,
+    x2: ModRingElementRef<'a, U>, y2: ModRingElementRef<'a, U>, z2: ModRingElementRef<'a, U>,
+    a: ModRingElementRef<'a, U>,
+    c2: ModRingElementRef<'a, U>, c4: ModRingElementRef<'a, U>, c8: ModRingElementRef<'a, U>,
+) -> (ModRingElementRef<'a, U>, ModRingElementRef<'a, U>, ModRingElementRef<'a, U>, bool) {
+    let z1z1 = z1 * z1;
+    let z2z2 = z2 * z2;
+    let u1 = x1 * z2z2;
+    let u2 = x2 * z1z1;
+    let s1 = y1 * z2 * z2z2;
+    let s2 = y2 * z1 * z1z1;
+    let h = u2 - u1;
+    let r = c2 * (s2 - s1);
+
+    if h.to_uint() == U::from_u64(0) {
+        if r.to_uint() == U::from_u64(0) {
+            // Points are equal — double instead
+            let (x3, y3, z3) = jac_double(x1, y1, z1, a, c2, c4, c8);
+            return (x3, y3, z3, false);
+        } else {
+            // Points are inverses — result is infinity
+            let zero = z1 - z1;
+            return (zero, zero, zero, true);
+        }
+    }
+
+    let i = c4 * h * h;
+    let j = h * i;
+    let v = u1 * i;
+    let x3 = r * r - j - c2 * v;
+    let y3 = r * (v - x3) - c2 * s1 * j;
+    let z3 = ((z1 + z2) * (z1 + z2) - z1z1 - z2z2) * h;
+    (x3, y3, z3, false)
+}
+
+/// Jacobian + affine mixed addition: (X1,Y1,Z1) + (x2,y2) -> (X3,Y3,Z3)
+/// Assumes second point is affine (Z2=1), saving ~4 field multiplications.
+/// https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian.html#addition-madd-2007-bl
+/// Returns (X3, Y3, Z3, is_infinity).
+#[inline(always)]
+fn jac_add_mixed<'a, U: UintMont>(
+    x1: ModRingElementRef<'a, U>, y1: ModRingElementRef<'a, U>, z1: ModRingElementRef<'a, U>,
+    x2: ModRingElementRef<'a, U>, y2: ModRingElementRef<'a, U>,
+    a: ModRingElementRef<'a, U>,
+    c2: ModRingElementRef<'a, U>, c4: ModRingElementRef<'a, U>, c8: ModRingElementRef<'a, U>,
+) -> (ModRingElementRef<'a, U>, ModRingElementRef<'a, U>, ModRingElementRef<'a, U>, bool) {
+    // Z2=1, so U1=X1, S1=Y1 (no Z2² multiplications needed)
+    let z1z1 = z1 * z1;
+    let u2 = x2 * z1z1;
+    let s2 = y2 * z1 * z1z1;
+    let h = u2 - x1;
+    let r = c2 * (s2 - y1);
+
+    if h.to_uint() == U::from_u64(0) {
+        if r.to_uint() == U::from_u64(0) {
+            let (x3, y3, z3) = jac_double(x1, y1, z1, a, c2, c4, c8);
+            return (x3, y3, z3, false);
+        } else {
+            let zero = z1 - z1;
+            return (zero, zero, zero, true);
+        }
+    }
+
+    let hh = h * h;
+    let i = c4 * hh;
+    let j = h * i;
+    let v = x1 * i;
+    let x3 = r * r - j - c2 * v;
+    let y3 = r * (v - x3) - c2 * y1 * j;
+    let z3 = (z1 + h) * (z1 + h) - z1z1 - hh;
+    (x3, y3, z3, false)
 }
 
 impl<'a, U: UintMont> EllipticCurvePoint<'a, U> {
@@ -226,11 +426,7 @@ impl<'a, U: UintMont> EllipticCurvePoint<'a, U> {
         }
     }
 
-    /// Scalar multiplication using Jacobian projective coordinates.
-    ///
-    /// Instead of affine coords (x, y) with a field inversion per point op,
-    /// Jacobian coords (X, Y, Z) where x=X/Z², y=Y/Z³ use only field
-    /// multiplications. Single inversion at the end to convert back to affine.
+    /// Scalar multiplication using Jacobian projective coordinates (right-to-left).
     ///
     /// Variable-time (branches on scalar bits). Fine for signature verification
     /// and ZK guests where side-channel resistance is irrelevant.
@@ -243,72 +439,9 @@ impl<'a, U: UintMont> EllipticCurvePoint<'a, U> {
         let field = self.curve.base_field();
         let a = self.curve.a();
         let c2 = field.from_u64(2);
-        let c3 = field.from_u64(3);
         let c4 = field.from_u64(4);
         let c8 = field.from_u64(8);
 
-        // Jacobian doubling: (X1,Y1,Z1) -> (X3,Y3,Z3)
-        // https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian.html#doubling-dbl-2007-bl
-        #[inline(always)]
-        fn jac_double<'a, U: UintMont>(
-            x1: ModRingElementRef<'a, U>, y1: ModRingElementRef<'a, U>, z1: ModRingElementRef<'a, U>,
-            a: ModRingElementRef<'a, U>,
-            c2: ModRingElementRef<'a, U>, c4: ModRingElementRef<'a, U>, c8: ModRingElementRef<'a, U>,
-        ) -> (ModRingElementRef<'a, U>, ModRingElementRef<'a, U>, ModRingElementRef<'a, U>) {
-            let xx = x1 * x1;
-            let yy = y1 * y1;
-            let yyyy = yy * yy;
-            let zz = z1 * z1;
-            let s = c2 * ((x1 + yy) * (x1 + yy) - xx - yyyy);
-            let m = c2 * xx + xx + a * (zz * zz); // 3*XX + a*ZZ²
-            let t = m * m - c2 * s;
-            let x3 = t;
-            let y3 = m * (s - t) - c8 * yyyy;
-            let z3 = (y1 + z1) * (y1 + z1) - yy - zz;
-            (x3, y3, z3)
-        }
-
-        // Jacobian addition: (X1,Y1,Z1) + (X2,Y2,Z2) -> (X3,Y3,Z3)
-        // https://hyperelliptic.org/EFD/g1p/auto-shortw-jacobian.html#addition-add-2007-bl
-        // Returns (X3, Y3, Z3, is_infinity)
-        #[inline(always)]
-        fn jac_add<'a, U: UintMont>(
-            x1: ModRingElementRef<'a, U>, y1: ModRingElementRef<'a, U>, z1: ModRingElementRef<'a, U>,
-            x2: ModRingElementRef<'a, U>, y2: ModRingElementRef<'a, U>, z2: ModRingElementRef<'a, U>,
-            a: ModRingElementRef<'a, U>,
-            c2: ModRingElementRef<'a, U>, c4: ModRingElementRef<'a, U>, c8: ModRingElementRef<'a, U>,
-        ) -> (ModRingElementRef<'a, U>, ModRingElementRef<'a, U>, ModRingElementRef<'a, U>, bool) {
-            let z1z1 = z1 * z1;
-            let z2z2 = z2 * z2;
-            let u1 = x1 * z2z2;
-            let u2 = x2 * z1z1;
-            let s1 = y1 * z2 * z2z2;
-            let s2 = y2 * z1 * z1z1;
-            let h = u2 - u1;
-            let r = c2 * (s2 - s1);
-
-            if h.to_uint() == U::from_u64(0) {
-                if r.to_uint() == U::from_u64(0) {
-                    // Points are equal — double instead
-                    let (x3, y3, z3) = jac_double(x1, y1, z1, a, c2, c4, c8);
-                    return (x3, y3, z3, false);
-                } else {
-                    // Points are inverses — result is infinity
-                    let zero = z1 - z1; // get a zero element with the right lifetime
-                    return (zero, zero, zero, true);
-                }
-            }
-
-            let i = c4 * h * h;
-            let j = h * i;
-            let v = u1 * i;
-            let x3 = r * r - j - c2 * v;
-            let y3 = r * (v - x3) - c2 * s1 * j;
-            let z3 = ((z1 + z2) * (z1 + z2) - z1z1 - z2z2) * h;
-            (x3, y3, z3, false)
-        }
-
-        // ── Scalar multiply using Jacobian double-and-add ───────────────
         // Base point in Jacobian: (x, y, 1)
         let mut bx = px;
         let mut by = py;

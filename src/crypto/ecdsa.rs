@@ -102,8 +102,8 @@ fn verify_ecdsa(
     let u1 = e_elem * w;
     let u2 = r_elem * w;
 
-    // X = u1·G + u2·Q
-    let point = curve.generator() * u1 + q * u2;
+    // X = u1·G + u2·Q  (Shamir's trick: single-pass double scalar mul)
+    let point = curve.double_scalar_mul(u1.to_uint(), curve.generator(), u2.to_uint(), q);
 
     // Check X ≠ ∞
     let (x_coord, _) = point.coordinates().ok_or_else(|| anyhow::anyhow!("Result is point at infinity"))?;
