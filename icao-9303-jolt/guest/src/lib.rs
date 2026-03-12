@@ -76,6 +76,18 @@ pub struct PassportProofOutput {
     pub csca_pubkey_hash: [u8; 32],
 }
 
+/// Output of a predicate ZK proof — verifier learns only a boolean predicate
+/// result (e.g. "over 18") without seeing any passport data.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PredicateOutput {
+    /// Whether the full chain of trust verified (SOD sig + cert chain + DG1 hash).
+    pub valid: bool,
+    /// The predicate result (e.g. true = over 18, true = nationality is allowed).
+    pub predicate: bool,
+    /// SHA-256 of the CSCA's SubjectPublicKeyInfo DER.
+    pub csca_pubkey_hash: [u8; 32],
+}
+
 // ─── Packed buffer helpers ──────────────────────────────────────────────────
 
 /// Append a length-prefixed, 4-byte-aligned field to a buffer.
@@ -625,4 +637,225 @@ fn verify_passport_struct(disclosure_mask: u8, passport: jolt::PrivateInput<Pass
         &passport.dg14,
         &passport.csca,
     )
+}
+
+// ─── Predicate proofs ────────────────────────────────────────────────────────
+
+/// Core verification for predicate proofs — verifies SOD signature, cert chain,
+/// and DG1 hash only (skips DG2-4/14 to save ~2.8M cycles).
+fn verify_passport_dg1_only(
+    signed_attrs_der: &[u8],
+    digest_alg_der: &[u8],
+    sig_algo_der: &[u8],
+    signature_bytes: &[u8],
+    ds_spki_der: &[u8],
+    lds_der: &[u8],
+    tbs_der: &[u8],
+    cert_sig_bytes: &[u8],
+    cert_sig_algo_der: &[u8],
+    ds_spki_offset: u32,
+    csca_spki_der: &[u8],
+    dg1: &[u8],
+) -> (bool, MrzRaw, [u8; 32]) {
+    // ── 1. Hash signed attributes ───────────────────────────────────────
+    start_cycle_tracking("hash_signed_attrs");
+    let digest = DigestAlgorithmIdentifier::from_der(digest_alg_der).unwrap();
+    let message_hash = digest.hash_bytes(signed_attrs_der);
+    end_cycle_tracking("hash_signed_attrs");
+
+    // ── 2. Structural checks ────────────────────────────────────────────
+    start_cycle_tracking("structural_checks");
+    let lds_hash = digest.hash_bytes(lds_der);
+    let msg_digest = extract_message_digest(signed_attrs_der)
+        .expect("messageDigest attribute not found in signed_attrs");
+    let structural_valid = msg_digest == lds_hash.as_slice();
+
+    let off = ds_spki_offset as usize;
+    let spki_in_tbs = off + ds_spki_der.len() <= tbs_der.len()
+        && &tbs_der[off..off + ds_spki_der.len()] == ds_spki_der;
+    let structural_valid = structural_valid && spki_in_tbs;
+    end_cycle_tracking("structural_checks");
+
+    // ── 3. RSA-PSS verification of SOD signature ────────────────────────
+    start_cycle_tracking("ring_setup");
+    let spki = SubjectPublicKeyInfo::from_der(ds_spki_der).unwrap();
+    let rsa_key = RSAPublicKey::<Uint2048>::try_from(spki).unwrap();
+    end_cycle_tracking("ring_setup");
+
+    start_cycle_tracking("mont_encode");
+    let sig_elem = rsa_key.ring.from(Uint2048::from_be_slice(signature_bytes));
+    let msg_elem = rsa_key.ring.from(Uint2048::from_be_slice(&message_hash));
+    let sig_algo = SignatureAlgorithmIdentifier::from_der(sig_algo_der).unwrap();
+    end_cycle_tracking("mont_encode");
+
+    start_cycle_tracking("rsa_verify");
+    let sig_valid = rsa_key.verify(msg_elem, sig_elem, &sig_algo).is_ok();
+    end_cycle_tracking("rsa_verify");
+
+    // ── 4. DG1 hash verification only ───────────────────────────────────
+    start_cycle_tracking("parse_lds");
+    let lso = LdsSecurityObject::from_der(lds_der).unwrap();
+    end_cycle_tracking("parse_lds");
+
+    start_cycle_tracking("dg_hash_verify");
+    let dg1_hash_valid = lso.verify_dg_hashes(&[(1, dg1)]).is_ok();
+    end_cycle_tracking("dg_hash_verify");
+
+    // ── 5. CSCA public key hash ─────────────────────────────────────────
+    start_cycle_tracking("csca_hash");
+    let csca_digest = DigestAlgorithmIdentifier::Sha256(
+        icao_9303::asn1::DigestAlgorithmParameters::Null,
+    );
+    let csca_pubkey_hash_vec = csca_digest.hash_bytes(csca_spki_der);
+    let mut csca_pubkey_hash = [0u8; 32];
+    csca_pubkey_hash.copy_from_slice(&csca_pubkey_hash_vec);
+    end_cycle_tracking("csca_hash");
+
+    // ── 6. Certificate chain ────────────────────────────────────────────
+    start_cycle_tracking("cert_chain_setup");
+    let csca_spki = SubjectPublicKeyInfo::from_der(csca_spki_der).unwrap();
+    let csca_rsa_key = RSAPublicKey::<Uint2048>::try_from(csca_spki).unwrap();
+
+    let cert_sig_algo = SignatureAlgorithmIdentifier::from_der(cert_sig_algo_der).unwrap();
+    let cert_digest_algo = match &cert_sig_algo {
+        SignatureAlgorithmIdentifier::RsaPss(params) => params.hash_algorithm.clone(),
+        _ => panic!("unsupported cert signature algorithm"),
+    };
+    let cert_message_hash = cert_digest_algo.hash_bytes(tbs_der);
+    let cert_sig_elem = csca_rsa_key.ring.from(Uint2048::from_be_slice(cert_sig_bytes));
+    let cert_msg_elem = csca_rsa_key.ring.from(Uint2048::from_be_slice(&cert_message_hash));
+    end_cycle_tracking("cert_chain_setup");
+
+    start_cycle_tracking("cert_chain_verify");
+    let cert_chain_valid = csca_rsa_key
+        .verify(cert_msg_elem, cert_sig_elem, &cert_sig_algo)
+        .is_ok();
+    end_cycle_tracking("cert_chain_verify");
+
+    let valid = structural_valid && sig_valid && dg1_hash_valid && cert_chain_valid;
+
+    // ── 7. Parse MRZ ────────────────────────────────────────────────────
+    start_cycle_tracking("mrz_parse");
+    let mrz = MrzRaw::from_dg1(dg1).unwrap();
+    end_cycle_tracking("mrz_parse");
+
+    (valid, mrz, csca_pubkey_hash)
+}
+
+/// Unpack pre-parsed buffer fields (shared by all predicate provable functions).
+fn unpack_preparsed(buf: &[u8]) -> (
+    &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], u32
+) {
+    let (signed_attrs_der, buf) = take_slice(buf);
+    let (digest_alg_der, buf) = take_slice(buf);
+    let (sig_algo_der, buf) = take_slice(buf);
+    let (signature_bytes, buf) = take_slice(buf);
+    let (ds_spki_der, buf) = take_slice(buf);
+    let (lds_der, buf) = take_slice(buf);
+    let (tbs_der, buf) = take_slice(buf);
+    let (cert_sig_bytes, buf) = take_slice(buf);
+    let (cert_sig_algo_der, buf) = take_slice(buf);
+    let (csca_spki_der, buf) = take_slice(buf);
+    let (ds_spki_offset, _) = take_u32(buf);
+    (
+        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
+        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
+        csca_spki_der, ds_spki_offset,
+    )
+}
+
+/// Compare MRZ YYMMDD date against a threshold.
+/// Returns true if the MRZ date is before the threshold (i.e. person is old enough).
+/// `threshold` is [YY, YY, MM, MM, DD, DD] as ASCII digits.
+fn mrz_date_before(date: &[u8; 6], threshold: &[u8; 6]) -> bool {
+    // Simple lexicographic comparison works for YYMMDD when century is handled.
+    // MRZ uses 2-digit year: 00-99. ICAO convention: 00-49 = 2000-2049, 50-99 = 1950-1999.
+    // For age checks, we compare birth year vs threshold year with century adjustment.
+    let birth_century: u8 = if date[0] >= b'5' { 19 } else { 20 };
+    let thresh_century: u8 = if threshold[0] >= b'5' { 19 } else { 20 };
+
+    if birth_century != thresh_century {
+        return birth_century < thresh_century;
+    }
+    // Same century — lexicographic comparison on YYMMDD
+    date < threshold
+}
+
+/// Predicate proof: passport holder is at least `min_age` years old.
+///
+/// Public inputs: `min_age`, `current_date` (YYMMDD, verifier checks it matches today).
+/// Output: PredicateOutput with `predicate = true` if holder is >= min_age.
+/// Only hashes DG1 — skips DG2-4/14 for ~50% cycle savings.
+#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x400000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
+fn check_age(
+    min_age: u8,
+    current_date: [u8; 6],
+    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
+    dg1: jolt::PrivateInput<Vec<u8>>,
+) -> PredicateOutput {
+    let (
+        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
+        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
+        csca_spki_der, ds_spki_offset,
+    ) = unpack_preparsed(&*preparsed_buf);
+
+    let (valid, mrz, csca_pubkey_hash) = verify_passport_dg1_only(
+        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
+        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
+        ds_spki_offset, csca_spki_der, &*dg1,
+    );
+
+    // Compute threshold date: current_date - min_age years
+    // YYMMDD subtraction: subtract min_age from year, keep month/day
+    let cur_yy = (current_date[0] - b'0') * 10 + (current_date[1] - b'0');
+    let thresh_yy = cur_yy.wrapping_sub(min_age);
+    let threshold: [u8; 6] = [
+        b'0' + thresh_yy / 10,
+        b'0' + thresh_yy % 10,
+        current_date[2], current_date[3], // same month
+        current_date[4], current_date[5], // same day
+    ];
+
+    let predicate = mrz_date_before(&mrz.date_of_birth, &threshold);
+
+    PredicateOutput { valid, predicate, csca_pubkey_hash }
+}
+
+/// Predicate proof: passport holder's nationality is in an allowed set.
+///
+/// Public inputs: `allowed` (concatenated 3-letter codes, up to 10 countries,
+/// e.g. b"USAGBRDEU000000000000000000000"). `allowed_count` = number of codes.
+/// Output: PredicateOutput with `predicate = true` if nationality is in the set.
+#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x400000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
+fn check_nationality(
+    allowed: [u8; 30],
+    allowed_count: u8,
+    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
+    dg1: jolt::PrivateInput<Vec<u8>>,
+) -> PredicateOutput {
+    let (
+        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
+        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
+        csca_spki_der, ds_spki_offset,
+    ) = unpack_preparsed(&*preparsed_buf);
+
+    let (valid, mrz, csca_pubkey_hash) = verify_passport_dg1_only(
+        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
+        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
+        ds_spki_offset, csca_spki_der, &*dg1,
+    );
+
+    // Check if nationality is in the allowed list (up to 10 × 3-byte codes)
+    let count = allowed_count as usize;
+    let mut predicate = false;
+    let mut i = 0;
+    while i < count && i * 3 + 3 <= allowed.len() {
+        if allowed[i * 3..i * 3 + 3] == mrz.nationality {
+            predicate = true;
+            break;
+        }
+        i += 1;
+    }
+
+    PredicateOutput { valid, predicate, csca_pubkey_hash }
 }

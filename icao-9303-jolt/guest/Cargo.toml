@@ -14,3 +14,4 @@ x509-cert = { version = "0.2", features = ["std"] }
 der       = { version = "0.7.9", features = ["oid", "derive", "std"] }
 ruint     = "1.12.4"
 serde     = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
