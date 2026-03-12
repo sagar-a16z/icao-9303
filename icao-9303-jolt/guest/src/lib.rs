@@ -19,12 +19,19 @@ type Uint2048 = Uint<2048, 32>;
 /// so the verifier never sees the raw bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PassportData {
+    #[serde(with = "serde_bytes")]
     pub sod: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub dg1: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub dg2: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub dg3: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub dg4: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub dg14: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub csca: Vec<u8>,
 }
 
@@ -33,10 +40,15 @@ pub struct PassportData {
 /// all DG bytes into a single flat buffer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PassportDGs {
+    #[serde(with = "serde_bytes")]
     pub dg1: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub dg2: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub dg3: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub dg4: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub dg14: Vec<u8>,
 }
 
