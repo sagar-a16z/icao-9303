@@ -450,24 +450,12 @@ fn verify_passport_inner(
     let spki = SubjectPublicKeyInfo::from_der(&spki_der).unwrap();
     end_cycle_tracking("extract_cert");
 
-    start_cycle_tracking("ring_setup");
-    let rsa_key = RSAPublicKey::<Uint2048>::try_from(spki).unwrap();
-    end_cycle_tracking("ring_setup");
-
-    // ── 4. RSA-PSS verification of SOD signature ────────────────────────────
-    start_cycle_tracking("mont_encode");
-    let sig_elem =
-        rsa_key.ring.from(Uint2048::from_be_slice(signer.signature.as_bytes()));
-    let msg_elem = rsa_key.ring.from(Uint2048::from_be_slice(&message_hash));
+    // ── 4. SOD signature verification (auto-detect RSA vs ECDSA) ────────────
     let sig_algo = SignatureAlgorithmIdentifier::from_der(
         &signer.signature_algorithm.to_der().unwrap(),
     )
     .unwrap();
-    end_cycle_tracking("mont_encode");
-
-    start_cycle_tracking("rsa_verify");
-    let sig_valid = rsa_key.verify(msg_elem, sig_elem, &sig_algo).is_ok();
-    end_cycle_tracking("rsa_verify");
+    let sig_valid = verify_signature(&spki, &sig_algo, signer.signature.as_bytes(), &message_hash);
 
     // ── 5. Data group hash verification ─────────────────────────────────────
     start_cycle_tracking("dg_hash_verify");
@@ -499,35 +487,18 @@ fn verify_passport_inner(
     csca_pubkey_hash.copy_from_slice(&csca_pubkey_hash_vec);
     end_cycle_tracking("csca_hash");
 
-    start_cycle_tracking("cert_chain_setup");
-    let csca_rsa_key = RSAPublicKey::<Uint2048>::try_from(csca_spki).unwrap();
-
     let tbs_der = ds_cert.tbs_certificate.to_der().unwrap();
     let cert_sig_algo = SignatureAlgorithmIdentifier::from_der(
         &ds_cert.signature_algorithm.to_der().unwrap(),
     )
     .unwrap();
-    let cert_digest_algo = match &cert_sig_algo {
-        SignatureAlgorithmIdentifier::RsaPss(params) => params.hash_algorithm.clone(),
-        _ => panic!("unsupported cert signature algorithm"),
-    };
+    let cert_digest_algo = cert_sig_algo.digest_algorithm();
     let cert_message_hash = cert_digest_algo.hash_bytes(&tbs_der);
-
     let cert_sig_bytes = ds_cert
         .signature
         .as_bytes()
         .expect("cert signature not a bit string");
-    let cert_sig_elem =
-        csca_rsa_key.ring.from(Uint2048::from_be_slice(cert_sig_bytes));
-    let cert_msg_elem =
-        csca_rsa_key.ring.from(Uint2048::from_be_slice(&cert_message_hash));
-    end_cycle_tracking("cert_chain_setup");
-
-    start_cycle_tracking("cert_chain_verify");
-    let cert_chain_valid = csca_rsa_key
-        .verify(cert_msg_elem, cert_sig_elem, &cert_sig_algo)
-        .is_ok();
-    end_cycle_tracking("cert_chain_verify");
+    let cert_chain_valid = verify_signature(&csca_spki, &cert_sig_algo, cert_sig_bytes, &cert_message_hash);
 
     let valid = sig_valid && dg_hashes_valid && cert_chain_valid;
 
@@ -555,7 +526,7 @@ fn verify_passport_inner(
 ///
 /// DGs are passed as a separate `PrivateInput<PassportDGs>` so each DG gets
 /// its own aligned heap allocation (fixes jolt-inlines-sha2 LW alignment regression).
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x800000, max_output_size = 64, max_untrusted_advice_size = 0x10000)]
+#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x1000000, max_output_size = 64, max_untrusted_advice_size = 0x10000)]
 fn verify_passport_packed(disclosure_mask: u8, preparsed_buf: jolt::PrivateInput<Vec<u8>>, dgs: jolt::PrivateInput<PassportDGs>) -> PassportProofOutput {
     let buf = &*preparsed_buf;
 
@@ -594,7 +565,7 @@ fn verify_passport_packed(disclosure_mask: u8, preparsed_buf: jolt::PrivateInput
 
 /// Baseline struct variant — Jolt macro postcard-deserializes the struct,
 /// guest does full CMS/X.509 DER parsing.
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x800000, max_output_size = 64, max_untrusted_advice_size = 0x10000)]
+#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x1000000, max_output_size = 64, max_untrusted_advice_size = 0x10000)]
 fn verify_passport_struct(disclosure_mask: u8, passport: jolt::PrivateInput<PassportData>) -> PassportProofOutput {
     let passport = &*passport;
 
