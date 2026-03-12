@@ -249,7 +249,7 @@ pub fn pack_preparsed_passport(
 /// The host extracts all needed fields; the guest does:
 /// - Lightweight DER parsing for algorithm identifiers (tiny structures)
 /// - Structural integrity checks (messageDigest ↔ LDS, SPKI ↔ TBS)
-/// - All cryptographic verification (RSA-PSS, SHA-256 DG hashing)
+/// - All cryptographic verification (RSA-PSS or ECDSA P-256, auto-detected)
 fn verify_passport_preparsed(
     disclosure_mask: u8,
     signed_attrs_der: &[u8],
@@ -290,22 +290,10 @@ fn verify_passport_preparsed(
     let structural_valid = structural_valid && spki_in_tbs;
     end_cycle_tracking("structural_checks");
 
-    // ── 3. Build DS RSA key from SPKI DER ─────────────────────────────────
-    start_cycle_tracking("ring_setup");
-    let spki = SubjectPublicKeyInfo::from_der(ds_spki_der).unwrap();
-    let rsa_key = RSAPublicKey::<Uint2048>::try_from(spki).unwrap();
-    end_cycle_tracking("ring_setup");
-
-    // ── 4. RSA-PSS verification of SOD signature ──────────────────────────
-    start_cycle_tracking("mont_encode");
-    let sig_elem = rsa_key.ring.from(Uint2048::from_be_slice(signature_bytes));
-    let msg_elem = rsa_key.ring.from(Uint2048::from_be_slice(&message_hash));
+    // ── 3. SOD signature verification (auto-detect RSA vs ECDSA) ─────────
+    let ds_spki = SubjectPublicKeyInfo::from_der(ds_spki_der).unwrap();
     let sig_algo = SignatureAlgorithmIdentifier::from_der(sig_algo_der).unwrap();
-    end_cycle_tracking("mont_encode");
-
-    start_cycle_tracking("rsa_verify");
-    let sig_valid = rsa_key.verify(msg_elem, sig_elem, &sig_algo).is_ok();
-    end_cycle_tracking("rsa_verify");
+    let sig_valid = verify_signature(&ds_spki, &sig_algo, signature_bytes, &message_hash);
 
     // ── 5. Data group hash verification via LDS ───────────────────────────
     start_cycle_tracking("parse_lds");
@@ -335,28 +323,11 @@ fn verify_passport_preparsed(
     end_cycle_tracking("csca_hash");
 
     // ── 7. Certificate chain: DS cert signed by CSCA ──────────────────────
-    start_cycle_tracking("cert_chain_setup");
     let csca_spki = SubjectPublicKeyInfo::from_der(csca_spki_der).unwrap();
-    let csca_rsa_key = RSAPublicKey::<Uint2048>::try_from(csca_spki).unwrap();
-
     let cert_sig_algo = SignatureAlgorithmIdentifier::from_der(cert_sig_algo_der).unwrap();
-    let cert_digest_algo = match &cert_sig_algo {
-        SignatureAlgorithmIdentifier::RsaPss(params) => params.hash_algorithm.clone(),
-        _ => panic!("unsupported cert signature algorithm"),
-    };
+    let cert_digest_algo = cert_sig_algo.digest_algorithm();
     let cert_message_hash = cert_digest_algo.hash_bytes(tbs_der);
-
-    let cert_sig_elem =
-        csca_rsa_key.ring.from(Uint2048::from_be_slice(cert_sig_bytes));
-    let cert_msg_elem =
-        csca_rsa_key.ring.from(Uint2048::from_be_slice(&cert_message_hash));
-    end_cycle_tracking("cert_chain_setup");
-
-    start_cycle_tracking("cert_chain_verify");
-    let cert_chain_valid = csca_rsa_key
-        .verify(cert_msg_elem, cert_sig_elem, &cert_sig_algo)
-        .is_ok();
-    end_cycle_tracking("cert_chain_verify");
+    let cert_chain_valid = verify_signature(&csca_spki, &cert_sig_algo, cert_sig_bytes, &cert_message_hash);
 
     let valid = structural_valid && sig_valid && dg_hashes_valid && cert_chain_valid;
 
@@ -643,6 +614,8 @@ fn verify_passport_struct(disclosure_mask: u8, passport: jolt::PrivateInput<Pass
 
 /// Core verification for predicate proofs — verifies SOD signature, cert chain,
 /// and DG1 hash only (skips DG2-4/14 to save ~2.8M cycles).
+///
+/// Auto-detects RSA vs ECDSA from the SPKI type — works for any crypto config.
 fn verify_passport_dg1_only(
     signed_attrs_der: &[u8],
     digest_alg_der: &[u8],
@@ -676,21 +649,10 @@ fn verify_passport_dg1_only(
     let structural_valid = structural_valid && spki_in_tbs;
     end_cycle_tracking("structural_checks");
 
-    // ── 3. RSA-PSS verification of SOD signature ────────────────────────
-    start_cycle_tracking("ring_setup");
-    let spki = SubjectPublicKeyInfo::from_der(ds_spki_der).unwrap();
-    let rsa_key = RSAPublicKey::<Uint2048>::try_from(spki).unwrap();
-    end_cycle_tracking("ring_setup");
-
-    start_cycle_tracking("mont_encode");
-    let sig_elem = rsa_key.ring.from(Uint2048::from_be_slice(signature_bytes));
-    let msg_elem = rsa_key.ring.from(Uint2048::from_be_slice(&message_hash));
+    // ── 3. SOD signature verification (auto-detect RSA vs ECDSA) ────────
+    let ds_spki = SubjectPublicKeyInfo::from_der(ds_spki_der).unwrap();
     let sig_algo = SignatureAlgorithmIdentifier::from_der(sig_algo_der).unwrap();
-    end_cycle_tracking("mont_encode");
-
-    start_cycle_tracking("rsa_verify");
-    let sig_valid = rsa_key.verify(msg_elem, sig_elem, &sig_algo).is_ok();
-    end_cycle_tracking("rsa_verify");
+    let sig_valid = verify_signature(&ds_spki, &sig_algo, signature_bytes, &message_hash);
 
     // ── 4. DG1 hash verification only ───────────────────────────────────
     start_cycle_tracking("parse_lds");
@@ -711,26 +673,12 @@ fn verify_passport_dg1_only(
     csca_pubkey_hash.copy_from_slice(&csca_pubkey_hash_vec);
     end_cycle_tracking("csca_hash");
 
-    // ── 6. Certificate chain ────────────────────────────────────────────
-    start_cycle_tracking("cert_chain_setup");
+    // ── 6. Certificate chain: DS cert signed by CSCA ────────────────────
     let csca_spki = SubjectPublicKeyInfo::from_der(csca_spki_der).unwrap();
-    let csca_rsa_key = RSAPublicKey::<Uint2048>::try_from(csca_spki).unwrap();
-
     let cert_sig_algo = SignatureAlgorithmIdentifier::from_der(cert_sig_algo_der).unwrap();
-    let cert_digest_algo = match &cert_sig_algo {
-        SignatureAlgorithmIdentifier::RsaPss(params) => params.hash_algorithm.clone(),
-        _ => panic!("unsupported cert signature algorithm"),
-    };
+    let cert_digest_algo = cert_sig_algo.digest_algorithm();
     let cert_message_hash = cert_digest_algo.hash_bytes(tbs_der);
-    let cert_sig_elem = csca_rsa_key.ring.from(Uint2048::from_be_slice(cert_sig_bytes));
-    let cert_msg_elem = csca_rsa_key.ring.from(Uint2048::from_be_slice(&cert_message_hash));
-    end_cycle_tracking("cert_chain_setup");
-
-    start_cycle_tracking("cert_chain_verify");
-    let cert_chain_valid = csca_rsa_key
-        .verify(cert_msg_elem, cert_sig_elem, &cert_sig_algo)
-        .is_ok();
-    end_cycle_tracking("cert_chain_verify");
+    let cert_chain_valid = verify_signature(&csca_spki, &cert_sig_algo, cert_sig_bytes, &cert_message_hash);
 
     let valid = structural_valid && sig_valid && dg1_hash_valid && cert_chain_valid;
 
@@ -740,6 +688,40 @@ fn verify_passport_dg1_only(
     end_cycle_tracking("mrz_parse");
 
     (valid, mrz, csca_pubkey_hash)
+}
+
+/// Verify a signature using the appropriate algorithm (RSA-PSS or ECDSA P-256)
+/// based on the public key type.
+fn verify_signature(
+    spki: &SubjectPublicKeyInfo,
+    sig_algo: &SignatureAlgorithmIdentifier,
+    signature_bytes: &[u8],
+    message_hash: &[u8],
+) -> bool {
+    match spki {
+        SubjectPublicKeyInfo::Rsa(_) => {
+            start_cycle_tracking("ring_setup");
+            let rsa_key = RSAPublicKey::<Uint2048>::try_from(spki.clone()).unwrap();
+            end_cycle_tracking("ring_setup");
+
+            start_cycle_tracking("mont_encode");
+            let sig_elem = rsa_key.ring.from(Uint2048::from_be_slice(signature_bytes));
+            let msg_elem = rsa_key.ring.from(Uint2048::from_be_slice(message_hash));
+            end_cycle_tracking("mont_encode");
+
+            start_cycle_tracking("rsa_verify");
+            let valid = rsa_key.verify(msg_elem, sig_elem, sig_algo).is_ok();
+            end_cycle_tracking("rsa_verify");
+            valid
+        }
+        SubjectPublicKeyInfo::Ec(ec) => {
+            start_cycle_tracking("ecdsa_verify");
+            let valid = verify_ecdsa_p256_fast(message_hash, signature_bytes, ec.point.as_bytes()).is_ok();
+            end_cycle_tracking("ecdsa_verify");
+            valid
+        }
+        _ => panic!("unsupported public key type for signature verification"),
+    }
 }
 
 /// Unpack pre-parsed buffer fields (shared by all predicate provable functions).
@@ -786,7 +768,7 @@ fn mrz_date_before(date: &[u8; 6], threshold: &[u8; 6]) -> bool {
 /// Public inputs: `min_age`, `current_date` (YYMMDD, verifier checks it matches today).
 /// Output: PredicateOutput with `predicate = true` if holder is >= min_age.
 /// Only hashes DG1 — skips DG2-4/14 for ~50% cycle savings.
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x400000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
+#[jolt::provable(heap_size = 0x800000, stack_size = 0x80000, max_trace_length = 0x800000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
 fn check_age(
     min_age: u8,
     current_date: [u8; 6],
@@ -826,7 +808,7 @@ fn check_age(
 /// Public inputs: `allowed` (concatenated 3-letter codes, up to 10 countries,
 /// e.g. b"USAGBRDEU000000000000000000000"). `allowed_count` = number of codes.
 /// Output: PredicateOutput with `predicate = true` if nationality is in the set.
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x400000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
+#[jolt::provable(heap_size = 0x800000, stack_size = 0x80000, max_trace_length = 0x800000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
 fn check_nationality(
     allowed: [u8; 30],
     allowed_count: u8,
@@ -860,182 +842,3 @@ fn check_nationality(
     PredicateOutput { valid, predicate, csca_pubkey_hash }
 }
 
-// ─── ECDSA P-256 predicate proofs ───────────────────────────────────────────
-
-/// Core verification for ECDSA P-256 predicate proofs.
-/// Same chain of trust as RSA but uses ECDSA for SOD signature + cert chain.
-fn verify_passport_dg1_only_ecdsa(
-    signed_attrs_der: &[u8],
-    digest_alg_der: &[u8],
-    _sig_algo_der: &[u8],
-    signature_bytes: &[u8],
-    ds_spki_der: &[u8],
-    lds_der: &[u8],
-    tbs_der: &[u8],
-    cert_sig_bytes: &[u8],
-    cert_sig_algo_der: &[u8],
-    ds_spki_offset: u32,
-    csca_spki_der: &[u8],
-    dg1: &[u8],
-) -> (bool, MrzRaw, [u8; 32]) {
-    // ── 1. Hash signed attributes ───────────────────────────────────────
-    start_cycle_tracking("hash_signed_attrs");
-    let digest = DigestAlgorithmIdentifier::from_der(digest_alg_der).unwrap();
-    let message_hash = digest.hash_bytes(signed_attrs_der);
-    end_cycle_tracking("hash_signed_attrs");
-
-    // ── 2. Structural checks ────────────────────────────────────────────
-    start_cycle_tracking("structural_checks");
-    let lds_hash = digest.hash_bytes(lds_der);
-    let msg_digest = extract_message_digest(signed_attrs_der)
-        .expect("messageDigest attribute not found in signed_attrs");
-    let structural_valid = msg_digest == lds_hash.as_slice();
-
-    let off = ds_spki_offset as usize;
-    let spki_in_tbs = off + ds_spki_der.len() <= tbs_der.len()
-        && &tbs_der[off..off + ds_spki_der.len()] == ds_spki_der;
-    let structural_valid = structural_valid && spki_in_tbs;
-    end_cycle_tracking("structural_checks");
-
-    // ── 3. Extract DS EC public key from SPKI ───────────────────────────
-    start_cycle_tracking("ec_key_setup");
-    let ds_spki = SubjectPublicKeyInfo::from_der(ds_spki_der).unwrap();
-    let ds_pubkey_bytes = match &ds_spki {
-        SubjectPublicKeyInfo::Ec(ec) => ec.point.as_bytes().to_vec(),
-        _ => panic!("Expected EC public key for ECDSA SOD signature"),
-    };
-    end_cycle_tracking("ec_key_setup");
-
-    // ── 4. ECDSA verification of SOD signature ──────────────────────────
-    start_cycle_tracking("ecdsa_verify_sod");
-    let sig_valid = verify_ecdsa_p256_fast(&message_hash, signature_bytes, &ds_pubkey_bytes).is_ok();
-    end_cycle_tracking("ecdsa_verify_sod");
-
-    // ── 5. DG1 hash verification only ───────────────────────────────────
-    start_cycle_tracking("parse_lds");
-    let lso = LdsSecurityObject::from_der(lds_der).unwrap();
-    end_cycle_tracking("parse_lds");
-
-    start_cycle_tracking("dg_hash_verify");
-    let dg1_hash_valid = lso.verify_dg_hashes(&[(1, dg1)]).is_ok();
-    end_cycle_tracking("dg_hash_verify");
-
-    // ── 6. CSCA public key hash ─────────────────────────────────────────
-    start_cycle_tracking("csca_hash");
-    let csca_digest = DigestAlgorithmIdentifier::Sha256(
-        icao_9303::asn1::DigestAlgorithmParameters::Null,
-    );
-    let csca_pubkey_hash_vec = csca_digest.hash_bytes(csca_spki_der);
-    let mut csca_pubkey_hash = [0u8; 32];
-    csca_pubkey_hash.copy_from_slice(&csca_pubkey_hash_vec);
-    end_cycle_tracking("csca_hash");
-
-    // ── 7. Certificate chain: DS cert signed by CSCA (ECDSA) ────────────
-    start_cycle_tracking("cert_chain_setup");
-    let csca_spki = SubjectPublicKeyInfo::from_der(csca_spki_der).unwrap();
-    let csca_pubkey_bytes = match &csca_spki {
-        SubjectPublicKeyInfo::Ec(ec) => ec.point.as_bytes().to_vec(),
-        _ => panic!("Expected EC public key for ECDSA cert chain"),
-    };
-
-    let cert_sig_algo = SignatureAlgorithmIdentifier::from_der(cert_sig_algo_der).unwrap();
-    let cert_digest_algo = match &cert_sig_algo {
-        SignatureAlgorithmIdentifier::EcdsaSha256 => DigestAlgorithmIdentifier::Sha256(
-            icao_9303::asn1::DigestAlgorithmParameters::Absent,
-        ),
-        SignatureAlgorithmIdentifier::EcdsaSha384 => DigestAlgorithmIdentifier::Sha384(
-            icao_9303::asn1::DigestAlgorithmParameters::Absent,
-        ),
-        SignatureAlgorithmIdentifier::EcdsaSha512 => DigestAlgorithmIdentifier::Sha512(
-            icao_9303::asn1::DigestAlgorithmParameters::Absent,
-        ),
-        _ => panic!("unsupported cert signature algorithm for ECDSA variant"),
-    };
-    let cert_message_hash = cert_digest_algo.hash_bytes(tbs_der);
-    end_cycle_tracking("cert_chain_setup");
-
-    start_cycle_tracking("ecdsa_verify_cert");
-    let cert_chain_valid = verify_ecdsa_p256_fast(
-        &cert_message_hash,
-        cert_sig_bytes,
-        &csca_pubkey_bytes,
-    ).is_ok();
-    end_cycle_tracking("ecdsa_verify_cert");
-
-    let valid = structural_valid && sig_valid && dg1_hash_valid && cert_chain_valid;
-
-    // ── 8. Parse MRZ ────────────────────────────────────────────────────
-    start_cycle_tracking("mrz_parse");
-    let mrz = MrzRaw::from_dg1(dg1).unwrap();
-    end_cycle_tracking("mrz_parse");
-
-    (valid, mrz, csca_pubkey_hash)
-}
-
-/// ECDSA P-256 age check — same as RSA check_age but uses ECDSA for all crypto.
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x80000, max_trace_length = 0x1000000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
-fn check_age_ecdsa(
-    min_age: u8,
-    current_date: [u8; 6],
-    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
-    dg1: jolt::PrivateInput<Vec<u8>>,
-) -> PredicateOutput {
-    let (
-        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
-        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
-        csca_spki_der, ds_spki_offset,
-    ) = unpack_preparsed(&*preparsed_buf);
-
-    let (valid, mrz, csca_pubkey_hash) = verify_passport_dg1_only_ecdsa(
-        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
-        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
-        ds_spki_offset, csca_spki_der, &*dg1,
-    );
-
-    let cur_yy = (current_date[0] - b'0') * 10 + (current_date[1] - b'0');
-    let thresh_yy = cur_yy.wrapping_sub(min_age);
-    let threshold: [u8; 6] = [
-        b'0' + thresh_yy / 10,
-        b'0' + thresh_yy % 10,
-        current_date[2], current_date[3],
-        current_date[4], current_date[5],
-    ];
-
-    let predicate = mrz_date_before(&mrz.date_of_birth, &threshold);
-
-    PredicateOutput { valid, predicate, csca_pubkey_hash }
-}
-
-/// ECDSA P-256 nationality check.
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x80000, max_trace_length = 0x1000000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
-fn check_nationality_ecdsa(
-    allowed: [u8; 30],
-    allowed_count: u8,
-    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
-    dg1: jolt::PrivateInput<Vec<u8>>,
-) -> PredicateOutput {
-    let (
-        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
-        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
-        csca_spki_der, ds_spki_offset,
-    ) = unpack_preparsed(&*preparsed_buf);
-
-    let (valid, mrz, csca_pubkey_hash) = verify_passport_dg1_only_ecdsa(
-        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
-        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
-        ds_spki_offset, csca_spki_der, &*dg1,
-    );
-
-    let count = allowed_count as usize;
-    let mut predicate = false;
-    let mut i = 0;
-    while i < count && i * 3 + 3 <= allowed.len() {
-        if allowed[i * 3..i * 3 + 3] == mrz.nationality {
-            predicate = true;
-            break;
-        }
-        i += 1;
-    }
-
-    PredicateOutput { valid, predicate, csca_pubkey_hash }
-}

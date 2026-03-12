@@ -189,6 +189,51 @@ ECDSA P-256 is **33x more expensive** than RSA-2048 in a RISC-V zkVM. This is ex
 - ECDSA requires 4 × 256-bit EC scalar multiplications (~18M each), plus field inversions
 - No constraint-native P-256 instructions exist in Jolt (unlike `jolt-inlines-secp256k1` for Bitcoin's curve)
 
+## Optimization 5: Solinas fast reduction for P-256 (`p256_fast`)
+
+**Goal**: Replace generic `ModRing`/`EllipticCurve` ECDSA with hand-tuned P-256 arithmetic.
+
+**Key techniques**:
+1. **FIPS 186-4 D.2.3 Solinas reduction**: P-256's prime `p = 2^256 - 2^224 + 2^192 + 2^96 - 1`
+   allows reducing 512-bit products to 256 bits using additions/subtractions of 32-bit word slices
+   instead of generic Montgomery reduction. Eliminates per-multiply modular reduction overhead.
+2. **Montgomery multiplication for scalar field**: Curve order `n` doesn't have special form,
+   so we use Montgomery representation with Newton's method for `N_INV` and repeated doubling
+   (512 iterations) for `R² mod N`.
+3. **a=-3 Jacobian doubling**: P-256 has `a = -3`, saving one field multiplication per point
+   doubling vs generic Jacobian.
+4. **Shamir's trick**: Single-pass double scalar multiplication (256 doublings instead of 512)
+   for `u1·G + u2·Q`.
+
+**Performance**:
+
+| Optimization | ECDSA Age Check Cycles | vs Previous |
+|-------------|----------------------|-------------|
+| Generic affine coords | ~202,000,000 | baseline |
+| Jacobian projective | ~115,000,000 | 1.75x |
+| + `new_unchecked()` | 74,029,449 | 1.55x |
+| **p256_fast (Solinas)** | **~6,036,364** | **12.3x** |
+
+**Total improvement: 33.5x** vs original generic ECDSA.
+
+**ECDSA vs RSA gap**: 6M vs 2.2M cycles = **2.7x** (was 33x before Solinas).
+
+**Code**: `src/crypto/p256_fast.rs` — `[u64; 4]` limb arithmetic, 8 comprehensive tests including
+cross-validation against the generic `ecdsa.rs` implementation and negative tests.
+
+## Optimization 6: Unified RSA/ECDSA auto-detection
+
+**Goal**: Eliminate duplicate `_ecdsa` provable functions by auto-detecting crypto from SPKI type.
+
+**Approach**: Single `verify_signature()` helper dispatches RSA-PSS or ECDSA P-256 based on
+whether `SubjectPublicKeyInfo` is `Rsa` or `Ec`. All provable functions (`check_age`,
+`check_nationality`, `verify_passport_packed`) now work with either RSA or ECDSA datasets.
+
+**Impact**: Removed 3 duplicate provable functions (`check_age_ecdsa`, `check_nationality_ecdsa`,
+`verify_passport_dg1_only_ecdsa`) — ~180 lines of duplicated guest code.
+
+CLI simplified: `cargo run --release age --dataset ecdsa` instead of separate `age-ecdsa` variant.
+
 **Future**: A `jolt-inlines-p256` crate (constraint-native P-256 operations) could reduce ECDSA
 to ~500K cycles, on par with RSA. This requires upstream Jolt SDK work to add P-256 as a native
 instruction set alongside secp256k1.

@@ -6,12 +6,12 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
 ## Current state
 
 ### Working (and proven in ZK)
-- **SOD signature verification** — RSA-PSS-SHA256 end-to-end
+- **SOD signature verification** — RSA-PSS-SHA256 and ECDSA P-256, auto-detected from SPKI type
 - **DG hash integrity** — SHA-256 of each DG (1,2,3,4,14) checked against SOD commitments
-- **Certificate chain verification** — DS cert signed by CSCA (RSA-PSS-SHA256, 2048-bit). Outputs SHA-256 of CSCA SPKI for trust store lookup.
-- **MRZ selective disclosure** — `verify_passport(disclosure_mask, passport) -> PassportProofOutput` returns only requested fields (nationality, DOB, sex, expiry, issuing state)
-- **Predicate proofs** — `check_age(min_age, current_date, ...)` and `check_nationality(allowed, ...)` for both RSA and ECDSA. Only hash DG1, 57% fewer cycles than full disclosure.
-- **ECDSA P-256 verification** — `check_age_ecdsa` / `check_nationality_ecdsa` provable functions. 74M cycles (33x RSA due to software EC scalar multiplication)
+- **Certificate chain verification** — DS cert signed by CSCA (RSA-PSS or ECDSA, auto-detected). Outputs SHA-256 of CSCA SPKI for trust store lookup.
+- **MRZ selective disclosure** — `verify_passport_packed(disclosure_mask, passport) -> PassportProofOutput` returns only requested fields (nationality, DOB, sex, expiry, issuing state)
+- **Predicate proofs** — `check_age(min_age, current_date, ...)` and `check_nationality(allowed, ...)` auto-detect RSA/ECDSA. Only hash DG1, 57% fewer cycles than full disclosure.
+- **p256_fast ECDSA** — hand-tuned Solinas reduction + Montgomery scalar field. ~6M cycles (was 74M before, 2.7x RSA vs 33x before).
 - **Private passport input** — `PassportData` struct (including CSCA cert) passed as `PrivateInput<T>`, cryptographically hidden by BlindFold
 - **BlindFold ZK** — `zk` feature on host and guest; witness hidden, verifier sees only `(disclosure_mask, PassportProofOutput)`
 - **jolt-inlines-sha2** — constraint-native SHA-256 for DG hashing (feature-gated `jolt-sha2`)
@@ -32,7 +32,7 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
 - **RSA-4096 in ZK guest** — library supports 4096-bit RSA, not yet wired into Jolt guest
 - **Expiry checking** — proof outputs expiry date but doesn't verify `expiry > today` inside guest
 - **CSCA trust store** — verifier gets CSCA pubkey hash but no on-chain/off-chain trust store lookup yet
-- **`jolt-inlines-p256`** — constraint-native P-256 would reduce ECDSA from 74M to ~500K cycles (requires upstream Jolt SDK work)
+- **`jolt-inlines-p256`** — constraint-native P-256 would reduce ECDSA from ~6M to ~500K cycles (requires upstream Jolt SDK work)
 
 ## Passive Authentication steps (ICAO 9303 Part 11)
 
@@ -47,9 +47,11 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
 
 - **Host**: `jolt-sdk` with `features = ["host", "zk"]`
 - **Guest**: `jolt-sdk` with `features = ["guest-std", "zk"]`
-- Two guest variants:
-  - `verify_passport_packed(mask, PrivateInput<Vec<u8>>)` — host pre-parses SOD/CSCA, guest skips DER parsing
+- Four provable functions (all auto-detect RSA vs ECDSA from SPKI type):
+  - `verify_passport_packed(mask, PrivateInput<Vec<u8>>, PrivateInput<PassportDGs>)` — host pre-parses SOD/CSCA, guest skips DER parsing
   - `verify_passport_struct(mask, PrivateInput<PassportData>)` — baseline, guest does full CMS/X.509 parsing
+  - `check_age(min_age, current_date, PrivateInput<...>, PrivateInput<...>)` — DG1-only predicate proof
+  - `check_nationality(allowed, allowed_count, PrivateInput<...>, PrivateInput<...>)` — DG1-only predicate proof
 - `pack_preparsed_passport()` extracts byte fields from SOD/CSCA on host, packs with raw DG bytes
 - Guest structural integrity checks: messageDigest ↔ LDS hash, DS SPKI ↔ TBS offset
 - `PassportData` includes `sod`, `dg1-4`, `dg14`, and `csca` (all `Vec<u8>`)
@@ -90,13 +92,13 @@ Note: ~1.7M cycles from postcard deserialization of ~64KB via `PrivateInput`. Tr
 
 ### Predicate proofs (DG1-only)
 
-| Variant | Total Cycles | Prove Time |
-|---------|-------------|------------|
-| RSA age check | 2,233,268 | ~9s |
-| RSA nationality check | 2,233,463 | ~9s |
-| ECDSA age check | 74,029,449 | ~5-10 min (est.) |
+| Variant | Total Cycles | Prove Time | `max_trace_length` |
+|---------|-------------|------------|-------------------|
+| RSA age check | 2,233,268 | ~9s | 2^23 |
+| ECDSA age check (p256_fast) | ~6,036,364 | ~15s (est.) | 2^23 |
 
-ECDSA P-256 is 33x more expensive than RSA-2048 — no constraint-native P-256 in Jolt. Software EC scalar multiplication: 4 × ~18M cycles per ECDSA verify × 2 verifies.
+ECDSA P-256 is 2.7x RSA-2048 after Solinas optimization (was 33x before).
+All predicate functions auto-detect RSA vs ECDSA — use `--dataset ecdsa` to switch.
 
 ## Test data
 
@@ -147,6 +149,7 @@ ECDSA P-256 is 33x more expensive than RSA-2048 — no constraint-native P-256 i
 
 ## Optimization opportunities
 1. **Zerocopy `PrivateInput`** — ~1.7M cycles (24%). Jolt SDK's `#[jolt::provable]` macro always uses postcard serde for `PrivateInput<T>`, even though `AdviceTapeIO` trait exists with bytemuck zero-copy. Requires upstream jolt-sdk PR to use `AdviceTapeIO` when available.
-2. **`jolt-inlines-p256`** — would reduce ECDSA from 74M to ~500K cycles. Requires upstream Jolt SDK work to add P-256 as a native instruction set (similar to existing `jolt-inlines-secp256k1` for Bitcoin's curve).
+2. **`jolt-inlines-p256`** — would reduce ECDSA from ~6M to ~500K cycles. Requires upstream Jolt SDK work to add P-256 as a native instruction set (similar to existing `jolt-inlines-secp256k1` for Bitcoin's curve).
 3. ~~**DER parsing offload**~~ — Done. Host pre-parses SOD/CSCA, saving ~450K cycles (5.9%).
 4. ~~**ECDSA Jacobian + new_unchecked**~~ — Done. 202M → 74M cycles (2.73x improvement).
+5. ~~**p256_fast Solinas reduction**~~ — Done. 74M → 6M cycles (12.3x). Hand-tuned `[u64; 4]` arithmetic with FIPS 186-4 D.2.3 Solinas reduction + Montgomery scalar field.

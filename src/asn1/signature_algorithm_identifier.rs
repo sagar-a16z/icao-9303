@@ -16,6 +16,19 @@ pub const ID_ECDSA_WITH_SHA256: Oid = Oid::new_unwrap("1.2.840.10045.4.3.2");
 pub const ID_ECDSA_WITH_SHA384: Oid = Oid::new_unwrap("1.2.840.10045.4.3.3");
 pub const ID_ECDSA_WITH_SHA512: Oid = Oid::new_unwrap("1.2.840.10045.4.3.4");
 
+impl SignatureAlgorithmIdentifier {
+    /// Return the digest algorithm implied by this signature algorithm.
+    pub fn digest_algorithm(&self) -> DigestAlgorithmIdentifier {
+        match self {
+            Self::RsaPss(params) => params.hash_algorithm.clone(),
+            Self::EcdsaSha256 => DigestAlgorithmIdentifier::Sha256(DigestAlgorithmParameters::Absent),
+            Self::EcdsaSha384 => DigestAlgorithmIdentifier::Sha384(DigestAlgorithmParameters::Absent),
+            Self::EcdsaSha512 => DigestAlgorithmIdentifier::Sha512(DigestAlgorithmParameters::Absent),
+            Self::Unknown(_) => panic!("cannot determine digest algorithm for unknown signature algorithm"),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum SignatureAlgorithmIdentifier {
     RsaPss(RsaPssParameters),

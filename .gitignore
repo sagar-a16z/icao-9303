@@ -23,3 +23,7 @@ Cargo.lock
 # Test data
 test
 tests/dataset-synth/
+tests/dataset-synth-ecdsa/
+
+# Jolt analysis output
+icao-9303-jolt/summary*.txt
