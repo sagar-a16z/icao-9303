@@ -62,43 +62,69 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
 
 ## Performance
 
-| Metric | Pre-parsed (packed) | Struct (baseline) |
-|--------|--------------------|--------------------|
-| Total cycles | 7,134,555 | 7,584,354 |
-| Prove time (M-series) | 17.2s @ 430 kHz | 18.1s @ 435 kHz |
-| Prover memory | <10 GB | <10 GB |
-| `max_trace_length` | 2^23 | 2^23 |
+### Cycle counts (all combinations)
 
-Pre-parsed saves ~450K cycles (5.9%) by having the host extract byte fields from SOD/CSCA, eliminating CMS/X.509 DER parsing in the guest.
+| Variant | RSA-PSS-SHA256 | ECDSA P-256 | `max_trace_length` |
+|---------|---------------|-------------|-------------------|
+| **Full disclosure (packed)** | 5,291,277 | 9,269,988 | 2^24 |
+| **Full disclosure (struct)** | 6,068,916 | 9,885,762 | 2^24 |
+| **Age predicate (DG1-only)** | 2,244,803 | 6,048,286 | 2^23 |
+| **Nationality predicate (DG1-only)** | ~2,245,000 | ~6,048,000 | 2^23 |
 
-Cycle breakdown (pre-parsed variant):
+Estimated prove times (Apple M-series, single-threaded):
+
+| `max_trace_length` | Peak RAM | RSA prove time | ECDSA prove time |
+|-------------------|----------|---------------|-----------------|
+| 2^23 (predicates) | <10 GB | ~9s | ~15s |
+| 2^24 (full disclosure) | ~15 GB | ~20s | ~25s |
+
+### Per-section breakdown
+
+**RSA packed (5.3M cycles):**
 
 | Section | Cycles | % |
 |---------|--------|---|
-| `dg_hash_verify` | 3,130,532 | 43.9% |
-| `cert_chain_verify` | 777,367 | 10.9% |
-| `rsa_verify` (SOD) | 764,674 | 10.7% |
-| `cert_chain_setup` | 250,805 | 3.5% |
-| `ring_setup` | 124,510 | 1.7% |
-| `mont_encode` | 96,357 | 1.4% |
-| `parse_lds` | 43,751 | 0.6% |
-| `structural_checks` | 26,605 | 0.4% |
-| `hash_signed_attrs` | 23,729 | 0.3% |
-| `csca_hash` | 17,822 | 0.2% |
-| `mrz_parse` | 429 | ~0% |
-| serde + overhead | ~1,877,974 | 26.3% |
+| `dg_hash_verify` (5 DGs) | 2,800,236 | 52.9% |
+| `rsa_verify` (cert chain) | 789,545 | 14.9% |
+| `rsa_verify` (SOD) | 767,029 | 14.5% |
+| `ring_setup` (×2) | 213,563 | 4.0% |
+| `mont_encode` (×2) | 122,760 | 2.3% |
+| `parse_lds` | 42,155 | 0.8% |
+| `structural_checks` | 26,589 | 0.5% |
+| `hash_signed_attrs` | 21,198 | 0.4% |
+| `csca_hash` | 17,817 | 0.3% |
+| `mrz_parse` | 421 | ~0% |
+| serde + overhead | ~490,000 | 9.3% |
 
-Note: ~1.7M cycles from postcard deserialization of ~64KB via `PrivateInput`. True zerocopy would need jolt-sdk changes to bypass postcard serde at the advice boundary. The `#[jolt::provable]` macro is hardcoded to use postcard for `PrivateInput<T>`, even though Jolt has a zero-copy `AdviceTapeIO` trait (using `bytemuck::Pod` for direct byte casting).
+**ECDSA packed (9.3M cycles):**
 
-### Predicate proofs (DG1-only)
+| Section | Cycles | % |
+|---------|--------|---|
+| `ecdsa_verify` (cert chain) | 2,921,333 | 31.5% |
+| `ecdsa_verify` (SOD) | 2,898,176 | 31.3% |
+| `dg_hash_verify` (5 DGs) | 2,800,224 | 30.2% |
+| `parse_lds` | 43,178 | 0.5% |
+| `structural_checks` | 23,569 | 0.3% |
+| `hash_signed_attrs` | 21,198 | 0.2% |
+| `csca_hash` | 8,143 | 0.1% |
+| `mrz_parse` | 421 | ~0% |
+| serde + overhead | ~554,000 | 6.0% |
 
-| Variant | Total Cycles | Prove Time | `max_trace_length` |
-|---------|-------------|------------|-------------------|
-| RSA age check | 2,233,268 | ~9s | 2^23 |
-| ECDSA age check (p256_fast) | ~6,036,364 | ~15s (est.) | 2^23 |
+**ECDSA age predicate (6.0M cycles):**
 
-ECDSA P-256 is 2.7x RSA-2048 after Solinas optimization (was 33x before).
-All predicate functions auto-detect RSA vs ECDSA — use `--dataset ecdsa` to switch.
+| Section | Cycles | % |
+|---------|--------|---|
+| `ecdsa_verify` (cert chain) | 2,920,123 | 48.3% |
+| `ecdsa_verify` (SOD) | 2,898,176 | 47.9% |
+| `parse_lds` | 42,103 | 0.7% |
+| `structural_checks` | 23,527 | 0.4% |
+| `hash_signed_attrs` | 20,478 | 0.3% |
+| `dg_hash_verify` (DG1 only) | 8,297 | 0.1% |
+| `csca_hash` | 8,367 | 0.1% |
+| `mrz_parse` | 1,044 | ~0% |
+| serde + overhead | ~126,000 | 2.1% |
+
+Note: ~1.7M cycles from postcard deserialization of ~64KB via `PrivateInput` in full disclosure variants. Predicate variants deserialize only ~2.4KB preparsed buffer + 93B DG1, cutting serde overhead to ~126K. True zerocopy would need jolt-sdk changes to bypass postcard serde at the advice boundary.
 
 ## Test data
 
