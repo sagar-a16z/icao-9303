@@ -111,3 +111,41 @@ confirming the regression was purely alignment-related.
 **Tracked sections total**: 4,930,284 (was 5,202,684 before fix)
 
 Estimated total with serde overhead: ~6,862K cycles — **~722K savings (9.5%) vs struct baseline**.
+
+## Optimization 3: serde_bytes on Vec<u8> fields
+
+**Goal**: Reduce postcard deserialization overhead for `PrivateInput<T>` structs containing
+`Vec<u8>` fields. Without `serde_bytes`, postcard deserializes each byte individually (~1 serde
+call per byte). With it, the entire byte slice is read in one shot.
+
+**Approach**: Annotate all `Vec<u8>` fields with `#[serde(with = "serde_bytes")]` in
+`PassportData`, `PassportDGs`, and any future structs passed as `PrivateInput`.
+
+**Impact**: serde overhead dropped from ~2M cycles to ~350-560K cycles — **~24% of total proof
+cycles saved** for the struct variant. The packed variant also benefits because `PassportDGs`
+(~61KB of DG data) is deserialized as a `PrivateInput`.
+
+## Predicate proofs: DG1-only verification
+
+**Goal**: For predicate checks (age, nationality), only DG1 matters — skip hashing DG2-4/14
+(~61KB of biometric data) to save ~2.8M cycles.
+
+**Why DG hashing can't be offloaded to advice**: The chain of trust requires the guest to hash
+raw DG bytes and compare against the signed LDS commitment. If the host provides hashes as
+advice, it could supply fake DG data with matching fake hashes — the guest must compute hashes
+itself to bind DG data to the SOD signature.
+
+**What predicate proofs skip**: Only DG1 (93 bytes, ~1K cycles to hash) is needed. DG2/3/4/14
+hashing (~2.8M cycles) is eliminated entirely. The full chain of trust is still verified:
+CSCA → DS cert → SOD signature → LDS → DG1 hash.
+
+**Results**:
+
+| Variant | Total Cycles | Prove Time | vs Full Packed |
+|---------|-------------|------------|----------------|
+| Full packed (5 DGs) | 5,281,961 | 19.7s | baseline |
+| Age check (DG1 only) | 2,233,268 | 9.3s | **-57.8%** |
+| Nationality check (DG1 only) | 2,233,463 | 9.4s | **-57.7%** |
+
+Predicate proofs output `PredicateOutput { valid, predicate, csca_pubkey_hash }` — the verifier
+learns only the boolean result and the CSCA identity, never the actual DOB or nationality.
