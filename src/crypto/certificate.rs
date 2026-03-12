@@ -10,7 +10,7 @@ use {
             DigestAlgorithmIdentifier, DigestAlgorithmParameters,
             SignatureAlgorithmIdentifier,
         },
-        crypto::{ecdsa, mod_ring::RingRefExt, rsa::RSAPublicKey},
+        crypto::{p256_fast, mod_ring::RingRefExt, rsa::RSAPublicKey},
     },
     anyhow::{bail, Result},
     der::{Decode, Encode},
@@ -104,7 +104,7 @@ fn verify_ecdsa_cert(
         _ => bail!("Expected EC public key for ECDSA signature verification"),
     };
     let message_hash = digest.hash_bytes(tbs_der);
-    ecdsa::verify_ecdsa_p256(&message_hash, sig_bytes, &pubkey_bytes)
+    p256_fast::verify_ecdsa_p256_fast(&message_hash, sig_bytes, &pubkey_bytes)
 }
 
 /// Extract the first certificate from an EF.SOD as an `x509_cert::Certificate`.

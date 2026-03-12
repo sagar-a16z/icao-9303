@@ -8,7 +8,7 @@ use {
             DigestAlgorithmIdentifier,
             SignatureAlgorithmIdentifier,
         },
-        crypto::{ecdsa, mod_ring::RingRefExt, rsa::RSAPublicKey},
+        crypto::{p256_fast, mod_ring::RingRefExt, rsa::RSAPublicKey},
     },
     anyhow::{bail, Result},
     cms::cert::CertificateChoices,
@@ -71,7 +71,7 @@ impl EfSod {
                     SubjectPublicKeyInfo::Ec(ec) => ec.point.as_bytes().to_vec(),
                     _ => bail!("Expected EC public key for ECDSA SOD signature"),
                 };
-                ecdsa::verify_ecdsa_p256(
+                p256_fast::verify_ecdsa_p256_fast(
                     &message_hash,
                     signer.signature.as_bytes(),
                     &pubkey_bytes,

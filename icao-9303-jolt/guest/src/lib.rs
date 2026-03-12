@@ -7,7 +7,7 @@ use icao_9303::{
         DigestAlgorithmIdentifier,
         SignatureAlgorithmIdentifier,
     },
-    crypto::{ecdsa::verify_ecdsa_p256, mod_ring::RingRefExt, rsa::RSAPublicKey},
+    crypto::{p256_fast::verify_ecdsa_p256_fast, mod_ring::RingRefExt, rsa::RSAPublicKey},
 };
 use jolt::{end_cycle_tracking, start_cycle_tracking};
 use ruint::Uint;
@@ -908,7 +908,7 @@ fn verify_passport_dg1_only_ecdsa(
 
     // ── 4. ECDSA verification of SOD signature ──────────────────────────
     start_cycle_tracking("ecdsa_verify_sod");
-    let sig_valid = verify_ecdsa_p256(&message_hash, signature_bytes, &ds_pubkey_bytes).is_ok();
+    let sig_valid = verify_ecdsa_p256_fast(&message_hash, signature_bytes, &ds_pubkey_bytes).is_ok();
     end_cycle_tracking("ecdsa_verify_sod");
 
     // ── 5. DG1 hash verification only ───────────────────────────────────
@@ -955,7 +955,7 @@ fn verify_passport_dg1_only_ecdsa(
     end_cycle_tracking("cert_chain_setup");
 
     start_cycle_tracking("ecdsa_verify_cert");
-    let cert_chain_valid = verify_ecdsa_p256(
+    let cert_chain_valid = verify_ecdsa_p256_fast(
         &cert_message_hash,
         cert_sig_bytes,
         &csca_pubkey_bytes,

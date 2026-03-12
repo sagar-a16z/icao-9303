@@ -6,6 +6,7 @@ pub mod certificate;
 mod codec;
 pub mod ecdsa;
 pub mod groups;
+pub mod p256_fast;
 pub mod mod_ring;
 pub mod rsa;
 mod signature;
