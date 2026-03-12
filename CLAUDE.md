@@ -10,12 +10,13 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
 - **DG hash integrity** — SHA-256 of each DG (1,2,3,4,14) checked against SOD commitments
 - **Certificate chain verification** — DS cert signed by CSCA (RSA-PSS-SHA256, 2048-bit). Outputs SHA-256 of CSCA SPKI for trust store lookup.
 - **MRZ selective disclosure** — `verify_passport(disclosure_mask, passport) -> PassportProofOutput` returns only requested fields (nationality, DOB, sex, expiry, issuing state)
+- **Predicate proofs** — `check_age(min_age, current_date, ...)` and `check_nationality(allowed, ...)` for both RSA and ECDSA. Only hash DG1, 57% fewer cycles than full disclosure.
+- **ECDSA P-256 verification** — `check_age_ecdsa` / `check_nationality_ecdsa` provable functions. 74M cycles (33x RSA due to software EC scalar multiplication)
 - **Private passport input** — `PassportData` struct (including CSCA cert) passed as `PrivateInput<T>`, cryptographically hidden by BlindFold
 - **BlindFold ZK** — `zk` feature on host and guest; witness hidden, verifier sees only `(disclosure_mask, PassportProofOutput)`
 - **jolt-inlines-sha2** — constraint-native SHA-256 for DG hashing (feature-gated `jolt-sha2`)
 
 ### Working (not in ZK guest)
-- **ECDSA P-256 verification** — complete `verify_ecdsa_p256()` with RFC 6979 test vector
 - **Multi-size RSA cert verification** — `verify_cert_signature(&ds, &csca)` supports RSA-PSS 2048/3072/4096-bit keys
 - **EfCom decoder** — `EfCom::from_bytes()` parses TLV listing which DGs are present
 
@@ -28,9 +29,10 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
 - BAC, Secure Messaging (3DES + AES), Chip Authentication skeleton, PACE key derivation
 
 ### Missing
-- **ECDSA in ZK guest** — verification works in library tests but not yet wired into Jolt guest
+- **RSA-4096 in ZK guest** — library supports 4096-bit RSA, not yet wired into Jolt guest
 - **Expiry checking** — proof outputs expiry date but doesn't verify `expiry > today` inside guest
 - **CSCA trust store** — verifier gets CSCA pubkey hash but no on-chain/off-chain trust store lookup yet
+- **`jolt-inlines-p256`** — constraint-native P-256 would reduce ECDSA from 74M to ~500K cycles (requires upstream Jolt SDK work)
 
 ## Passive Authentication steps (ICAO 9303 Part 11)
 
@@ -86,6 +88,16 @@ Cycle breakdown (pre-parsed variant):
 
 Note: ~1.7M cycles from postcard deserialization of ~64KB via `PrivateInput`. True zerocopy would need jolt-sdk changes to bypass postcard serde at the advice boundary. The `#[jolt::provable]` macro is hardcoded to use postcard for `PrivateInput<T>`, even though Jolt has a zero-copy `AdviceTapeIO` trait (using `bytemuck::Pod` for direct byte casting).
 
+### Predicate proofs (DG1-only)
+
+| Variant | Total Cycles | Prove Time |
+|---------|-------------|------------|
+| RSA age check | 2,233,268 | ~9s |
+| RSA nationality check | 2,233,463 | ~9s |
+| ECDSA age check | 74,029,449 | ~5-10 min (est.) |
+
+ECDSA P-256 is 33x more expensive than RSA-2048 — no constraint-native P-256 in Jolt. Software EC scalar multiplication: 4 × ~18M cycles per ECDSA verify × 2 verifies.
+
 ## Test data
 
 ### `tests/dataset/` — BSI TR-03105-5 ReferenceDataSet (German)
@@ -105,26 +117,36 @@ Note: ~1.7M cycles from postcard deserialization of ~64KB via `PrivateInput`. Tr
 - `EF_SOD.bin` — RSA-PSS-SHA256
 - No CSCA cert for this passport
 
-### `tests/dataset-synth/` — Synthetic e2e dataset (generated)
+### `tests/dataset-synth/` — Synthetic RSA e2e dataset (generated)
 - `CSCA.cer` — Self-signed RSA 2048 Country Signing CA
 - `DSC.cer` — Document Signer cert signed by CSCA (RSA-PSS-SHA256)
 - `EF_SOD.bin` — CMS-signed LdsSecurityObject committing BSI DG hashes
 - Uses BSI DG files from `tests/dataset/` for complete steps 1+2+3
 - Regenerate: `./tests/gen-synthetic-dataset.sh`
 
+### `tests/dataset-synth-ecdsa/` — Synthetic ECDSA P-256 e2e dataset (generated)
+- `CSCA.cer` — Self-signed ECDSA P-256 Country Signing CA
+- `DSC.cer` — Document Signer cert signed by CSCA (ECDSA-SHA256)
+- `EF_SOD.bin` — CMS-signed LdsSecurityObject with ECDSA-SHA256 signature
+- Uses BSI DG files from `tests/dataset/` for complete steps 1+2+3
+- Regenerate: `./tests/gen-synthetic-dataset-ecdsa.sh`
+
 | Dataset | SOD | DG bins | CSCA | Steps |
 |---------|-----|---------|------|-------|
 | BSI (DE) | ✅ | ✅ | ❌ | 1+2 |
 | MY | ✅ | ❌ | ✅ | 1+3 |
 | UK | ✅ | ✅ | ❌ | 1+2 |
-| Synthetic | ✅ | ✅ (BSI) | ✅ | 1+2+3 |
+| Synthetic RSA | ✅ | ✅ (BSI) | ✅ | 1+2+3 |
+| Synthetic ECDSA | ✅ | ✅ (BSI) | ✅ | 1+2+3 |
 
 ## What to work on (priority order)
-1. Wire ECDSA into ZK guest for EC-signed passports
-2. Predicate proofs (e.g. "age > 18") instead of raw field disclosure
-3. CSCA trust store — on-chain Merkle tree or smart contract lookup
+1. Generate synthetic RSA-4096 dataset + `verify_passport_rsa4096` provable function
+2. CSCA trust store — on-chain Merkle tree or smart contract lookup
+3. Make DG set flexible instead of hardcoded `[1,2,3,4,14]`
+4. Test real CSCA cert parsing from ICAO PKD (library-side tests)
 
 ## Optimization opportunities
 1. **Zerocopy `PrivateInput`** — ~1.7M cycles (24%). Jolt SDK's `#[jolt::provable]` macro always uses postcard serde for `PrivateInput<T>`, even though `AdviceTapeIO` trait exists with bytemuck zero-copy. Requires upstream jolt-sdk PR to use `AdviceTapeIO` when available.
-2. **`jolt-inlines-secp256k1`** — when ECDSA verification is added to ZK guest
+2. **`jolt-inlines-p256`** — would reduce ECDSA from 74M to ~500K cycles. Requires upstream Jolt SDK work to add P-256 as a native instruction set (similar to existing `jolt-inlines-secp256k1` for Bitcoin's curve).
 3. ~~**DER parsing offload**~~ — Done. Host pre-parses SOD/CSCA, saving ~450K cycles (5.9%).
+4. ~~**ECDSA Jacobian + new_unchecked**~~ — Done. 202M → 74M cycles (2.73x improvement).

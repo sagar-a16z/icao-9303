@@ -149,3 +149,46 @@ CSCA → DS cert → SOD signature → LDS → DG1 hash.
 
 Predicate proofs output `PredicateOutput { valid, predicate, csca_pubkey_hash }` — the verifier
 learns only the boolean result and the CSCA identity, never the actual DOB or nationality.
+
+## ECDSA P-256 support
+
+**Goal**: Support passports signed with ECDSA P-256 (secp256r1) instead of RSA-PSS.
+
+**Approach**:
+- Library: Extended `SignatureAlgorithmIdentifier` with ECDSA-SHA256/384/512 variants
+- Library: Added `verify_ecdsa_cert()` and updated `verify_cert_signature()` + `EfSod::verify_signature()`
+- Guest: Added `verify_passport_dg1_only_ecdsa()` and ECDSA predicate functions (`check_age_ecdsa`, `check_nationality_ecdsa`)
+- Test data: `tests/gen-synthetic-dataset-ecdsa.sh` generates synthetic ECDSA P-256 CSCA + DS + SOD
+
+**Performance evolution**:
+
+| Optimization | ECDSA Age Check Cycles | Improvement |
+|-------------|----------------------|-------------|
+| Affine coordinates + `new()` | ~202,000,000 | baseline |
+| Jacobian projective coords | ~115,000,000 | 1.75x |
+| + `new_unchecked()` for secp256r1 | 74,029,449 | 2.73x total |
+
+**Key optimizations**:
+1. **Jacobian projective coordinates** (`elliptic_curve.rs`): Replaced affine double-and-add
+   (1 field inversion per point op, ~256 inversions/scalar mul) with Jacobian (X,Y,Z) coordinates.
+   Only multiplications during computation, single inversion at the end.
+2. **`new_unchecked()`** (`elliptic_curve.rs`, `named.rs`): `EllipticCurve::new()` validates the
+   generator has the claimed order via a full scalar multiply. `secp256r1()` was calling this every
+   time, and `verify_ecdsa_p256()` constructs the curve twice (SOD + cert chain) = 4 unnecessary
+   scalar multiplications. `new_unchecked()` skips validation; `test_construct` validates separately.
+
+**Comparison: ECDSA vs RSA predicate proofs**:
+
+| Variant | Total Cycles | `max_trace_length` | Estimated Prove Time |
+|---------|-------------|-------------------|---------------------|
+| RSA age check | 2,233,268 | 2^22 | ~9s |
+| ECDSA age check | 74,029,449 | 2^27 | ~5-10 min |
+
+ECDSA P-256 is **33x more expensive** than RSA-2048 in a RISC-V zkVM. This is expected:
+- RSA is one 2048-bit modular exponentiation (~750K cycles)
+- ECDSA requires 4 × 256-bit EC scalar multiplications (~18M each), plus field inversions
+- No constraint-native P-256 instructions exist in Jolt (unlike `jolt-inlines-secp256k1` for Bitcoin's curve)
+
+**Future**: A `jolt-inlines-p256` crate (constraint-native P-256 operations) could reduce ECDSA
+to ~500K cycles, on par with RSA. This requires upstream Jolt SDK work to add P-256 as a native
+instruction set alongside secp256k1.
