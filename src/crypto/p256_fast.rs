@@ -572,4 +572,122 @@ mod tests {
         verify_ecdsa_p256_fast(&message_hash, &sig_der, &pubkey)?;
         Ok(())
     }
+
+    /// Cross-validate p256_fast ECDSA against the ruint-based generic implementation.
+    /// Both must accept the same valid signature and produce the same result.
+    #[test]
+    fn test_p256_fast_matches_generic_ecdsa() -> anyhow::Result<()> {
+        use crate::crypto::ecdsa::verify_ecdsa_p256;
+        use crate::crypto::groups::named::secp256r1;
+
+        let curve = secp256r1();
+        let d = U256::from_be_slice(&hex_literal::hex!(
+            "C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721"
+        ));
+        let d_scalar = curve.scalar_field().from(d);
+        let q = curve.generator() * d_scalar;
+        let (qx, qy) = q.coordinates().unwrap();
+        let mut pubkey = [0u8; 65];
+        pubkey[0] = 0x04;
+        pubkey[1..33].copy_from_slice(&qx.to_uint().to_be_bytes::<32>());
+        pubkey[33..65].copy_from_slice(&qy.to_uint().to_be_bytes::<32>());
+
+        let r_bytes = hex_literal::hex!(
+            "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716"
+        );
+        let s_bytes = hex_literal::hex!(
+            "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8"
+        );
+        let message_hash = hex_literal::hex!(
+            "AF2BDBE1AA9B6EC1E2ADE1D694F41FC71A831D0268E9891562113D8A62ADD1BF"
+        );
+
+        fn encode_integer(val: &[u8]) -> Vec<u8> {
+            let mut out = vec![0x02];
+            if val[0] & 0x80 != 0 { out.push((val.len() + 1) as u8); out.push(0x00); }
+            else { out.push(val.len() as u8); }
+            out.extend_from_slice(val);
+            out
+        }
+        let r_enc = encode_integer(&r_bytes);
+        let s_enc = encode_integer(&s_bytes);
+        let mut sig_der = vec![0x30, (r_enc.len() + s_enc.len()) as u8];
+        sig_der.extend_from_slice(&r_enc);
+        sig_der.extend_from_slice(&s_enc);
+
+        // Both implementations must accept the valid signature
+        verify_ecdsa_p256(&message_hash, &sig_der, &pubkey)?;
+        verify_ecdsa_p256_fast(&message_hash, &sig_der, &pubkey)?;
+
+        // Both must reject a tampered signature (flip a bit in the r value, past any DER padding)
+        let mut bad_sig = sig_der.clone();
+        bad_sig[5] ^= 0x01; // flip bit in r value (byte after potential 0x00 padding)
+        assert!(verify_ecdsa_p256(&message_hash, &bad_sig, &pubkey).is_err());
+        assert!(verify_ecdsa_p256_fast(&message_hash, &bad_sig, &pubkey).is_err());
+
+        // Both must reject a wrong message hash
+        let mut bad_hash = message_hash;
+        bad_hash[0] ^= 0x01;
+        assert!(verify_ecdsa_p256(&bad_hash, &sig_der, &pubkey).is_err());
+        assert!(verify_ecdsa_p256_fast(&bad_hash, &sig_der, &pubkey).is_err());
+
+        // Both must reject a wrong public key
+        let mut bad_pubkey = pubkey;
+        bad_pubkey[1] ^= 0x01;
+        // Note: bad pubkey might fail at parsing (not on curve) or at verification
+        let generic_err = verify_ecdsa_p256(&message_hash, &sig_der, &bad_pubkey).is_err();
+        let fast_err = verify_ecdsa_p256_fast(&message_hash, &sig_der, &bad_pubkey).is_err();
+        assert!(generic_err, "generic should reject bad pubkey");
+        assert!(fast_err, "fast should reject bad pubkey");
+
+        Ok(())
+    }
+
+    /// Test that Solinas reduction handles all 9 s-values correctly by checking
+    /// that a * b mod p = (a * b mod p) for values that exercise high 32-bit words.
+    #[test]
+    fn test_solinas_high_word_coverage() {
+        let p_u256 = limbs_to_u256(&P);
+        // Values that produce large products exercising all 16 32-bit words of the 512-bit intermediate
+        let vals: Vec<[u64; 4]> = vec![
+            P.map(|x| x.wrapping_sub(1)),  // p-1 (all words near max)
+            [u64::MAX, u64::MAX, u64::MAX, 0xFFFFFFFE00000000], // just under p
+            [0, 0, 0, 0xFFFFFFFE00000000], // high word only
+            [u64::MAX, 0, 0, 0],            // low word only
+            [0, u64::MAX, 0, 0],            // word 1 only
+            [0, 0, u64::MAX, 0],            // word 2 only (should be 0 in product for some s-values)
+        ];
+        for a in &vals {
+            let a_mod = u256_to_limbs(limbs_to_u256(a) % p_u256);
+            for b in &vals {
+                let b_mod = u256_to_limbs(limbs_to_u256(b) % p_u256);
+                let fast = p256_field_mul(&a_mod, &b_mod);
+                let expected = u256_to_limbs(limbs_to_u256(&a_mod).mul_mod(limbs_to_u256(&b_mod), p_u256));
+                assert_eq!(fast, expected,
+                    "solinas mismatch: a={a_mod:?}, b={b_mod:?}");
+            }
+        }
+    }
+
+    /// Verify scalar field inversion: s * s^{-1} = 1 (mod N)
+    #[test]
+    fn test_scalar_inversion() {
+        let ctx = ScalarMontCtx::new();
+        let test_vals: Vec<[u64; 4]> = vec![
+            [1, 0, 0, 0],
+            [2, 0, 0, 0],
+            u256_sub(&N, &[1, 0, 0, 0]),
+            GX,
+            [0xDEADBEEF_CAFEBABE, 0x1234567890ABCDEF, 0xFEDCBA0987654321, 0x0102030405060708],
+        ];
+        let n_u256 = limbs_to_u256(&N);
+        let exp = u256_sub(&N, &[2, 0, 0, 0]);
+        for s in &test_vals {
+            let s_mod = u256_to_limbs(limbs_to_u256(s) % n_u256);
+            let s_inv = ctx.pow(&s_mod, &exp);
+            let product = ctx.mul(&s_mod, &s_inv);
+            assert_eq!(product, [1, 0, 0, 0],
+                "s * s^{{-1}} != 1 for s={s_mod:?}");
+        }
+    }
 }
