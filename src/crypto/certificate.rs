@@ -7,9 +7,10 @@ use {
     crate::{
         asn1::{
             public_key_info::SubjectPublicKeyInfo,
+            DigestAlgorithmIdentifier, DigestAlgorithmParameters,
             SignatureAlgorithmIdentifier,
         },
-        crypto::{mod_ring::RingRefExt, rsa::RSAPublicKey},
+        crypto::{ecdsa, mod_ring::RingRefExt, rsa::RSAPublicKey},
     },
     anyhow::{bail, Result},
     der::{Decode, Encode},
@@ -44,26 +45,35 @@ pub fn verify_cert_signature(
     let sig_algo =
         SignatureAlgorithmIdentifier::from_der(&cert.signature_algorithm.to_der()?)?;
 
-    let digest_algo = match &sig_algo {
-        SignatureAlgorithmIdentifier::RsaPss(params) => params.hash_algorithm.clone(),
-        _ => bail!("Unsupported signature algorithm for certificate verification (only RSA-PSS currently supported)"),
-    };
-
-    let message_hash = digest_algo.hash_bytes(&tbs_der);
-
     let sig_bytes = cert
         .signature
         .as_bytes()
         .ok_or_else(|| anyhow::anyhow!("Certificate signature is not a bit string"))?;
 
-    // ── 3. Dispatch by signature byte length (= modulus size in bytes) ────
-    let sig_bit_len = sig_bytes.len() * 8;
-
-    match sig_bit_len {
-        ..=2048 => verify_rsa_cert::<2048, 32>(issuer_spki, sig_bytes, &message_hash, &sig_algo),
-        ..=3072 => verify_rsa_cert::<3072, 48>(issuer_spki, sig_bytes, &message_hash, &sig_algo),
-        ..=4096 => verify_rsa_cert::<4096, 64>(issuer_spki, sig_bytes, &message_hash, &sig_algo),
-        _ => bail!("RSA signature too large: {sig_bit_len} bits"),
+    match &sig_algo {
+        SignatureAlgorithmIdentifier::RsaPss(params) => {
+            let message_hash = params.hash_algorithm.hash_bytes(&tbs_der);
+            let sig_bit_len = sig_bytes.len() * 8;
+            match sig_bit_len {
+                ..=2048 => verify_rsa_cert::<2048, 32>(issuer_spki, sig_bytes, &message_hash, &sig_algo),
+                ..=3072 => verify_rsa_cert::<3072, 48>(issuer_spki, sig_bytes, &message_hash, &sig_algo),
+                ..=4096 => verify_rsa_cert::<4096, 64>(issuer_spki, sig_bytes, &message_hash, &sig_algo),
+                _ => bail!("RSA signature too large: {sig_bit_len} bits"),
+            }
+        }
+        SignatureAlgorithmIdentifier::EcdsaSha256 => {
+            let digest = DigestAlgorithmIdentifier::Sha256(DigestAlgorithmParameters::Absent);
+            verify_ecdsa_cert(issuer_spki, sig_bytes, &tbs_der, &digest)
+        }
+        SignatureAlgorithmIdentifier::EcdsaSha384 => {
+            let digest = DigestAlgorithmIdentifier::Sha384(DigestAlgorithmParameters::Absent);
+            verify_ecdsa_cert(issuer_spki, sig_bytes, &tbs_der, &digest)
+        }
+        SignatureAlgorithmIdentifier::EcdsaSha512 => {
+            let digest = DigestAlgorithmIdentifier::Sha512(DigestAlgorithmParameters::Absent);
+            verify_ecdsa_cert(issuer_spki, sig_bytes, &tbs_der, &digest)
+        }
+        _ => bail!("Unsupported signature algorithm for certificate verification"),
     }
 }
 
@@ -81,6 +91,20 @@ where
     let msg_elem = rsa_key.ring.from(Uint::<B, L>::from_be_slice(message_hash));
     rsa_key.verify(msg_elem, sig_elem, sig_algo)?;
     Ok(())
+}
+
+fn verify_ecdsa_cert(
+    issuer_spki: SubjectPublicKeyInfo,
+    sig_bytes: &[u8],
+    tbs_der: &[u8],
+    digest: &DigestAlgorithmIdentifier,
+) -> Result<()> {
+    let pubkey_bytes = match issuer_spki {
+        SubjectPublicKeyInfo::Ec(ec) => ec.point.as_bytes().to_vec(),
+        _ => bail!("Expected EC public key for ECDSA signature verification"),
+    };
+    let message_hash = digest.hash_bytes(tbs_der);
+    ecdsa::verify_ecdsa_p256(&message_hash, sig_bytes, &pubkey_bytes)
 }
 
 /// Extract the first certificate from an EF.SOD as an `x509_cert::Certificate`.
@@ -138,6 +162,42 @@ mod tests {
 
         verify_cert_signature(&ds, &csca)?;
         println!("Step 3 OK: DS cert signed by CSCA");
+
+        Ok(())
+    }
+
+    /// Synthetic ECDSA P-256 dataset: full Passive Authentication steps 1 + 2 + 3.
+    /// Uses BSI DG files with a synthetic ECDSA CSCA + DS + SOD.
+    #[test]
+    fn test_synthetic_ecdsa_full_passive_auth() -> anyhow::Result<()> {
+        let csca_der = std::fs::read("tests/dataset-synth-ecdsa/CSCA.cer")?;
+        let sod_bytes = std::fs::read("tests/dataset-synth-ecdsa/EF_SOD.bin")?;
+
+        // Step 1: verify SOD signature (ECDSA-SHA256)
+        let sod = crate::asn1::emrtd::EfSod::from_der(&sod_bytes)?;
+        sod.verify_signature()?;
+        println!("Step 1 OK: SOD signature valid (ECDSA-SHA256)");
+
+        // Step 2: verify DG hashes match SOD commitments
+        let dg1 = std::fs::read("tests/dataset/Datagroup1.bin")?;
+        let dg2 = std::fs::read("tests/dataset/Datagroup2.bin")?;
+        let dg3 = std::fs::read("tests/dataset/Datagroup3.bin")?;
+        let dg4 = std::fs::read("tests/dataset/Datagroup4.bin")?;
+        let dg14 = std::fs::read("tests/dataset/Datagroup14.bin")?;
+        sod.verify_dg_hashes(&[
+            (1, &dg1), (2, &dg2), (3, &dg3), (4, &dg4), (14, &dg14),
+        ])?;
+        println!("Step 2 OK: DG hashes match SOD commitments");
+
+        // Step 3: verify DS cert chains to CSCA (ECDSA-SHA256)
+        let csca = x509_cert::Certificate::from_der(&csca_der)?;
+        let ds = ds_cert_from_sod(&sod)?;
+
+        println!("CSCA: {}", csca.tbs_certificate.subject);
+        println!("DS:   {}", ds.tbs_certificate.subject);
+
+        verify_cert_signature(&ds, &csca)?;
+        println!("Step 3 OK: DS cert signed by CSCA (ECDSA-SHA256)");
 
         Ok(())
     }

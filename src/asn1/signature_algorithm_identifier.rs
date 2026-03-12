@@ -11,9 +11,17 @@ use {
 pub const ID_SIG_RSASSA_PSS: Oid = Oid::new_unwrap("1.2.840.113549.1.1.10");
 pub const ID_MGFA_MGF1: Oid = Oid::new_unwrap("1.2.840.113549.1.1.8");
 
+// ECDSA with SHA-2 family (RFC 5758 / ANSI X9.62)
+pub const ID_ECDSA_WITH_SHA256: Oid = Oid::new_unwrap("1.2.840.10045.4.3.2");
+pub const ID_ECDSA_WITH_SHA384: Oid = Oid::new_unwrap("1.2.840.10045.4.3.3");
+pub const ID_ECDSA_WITH_SHA512: Oid = Oid::new_unwrap("1.2.840.10045.4.3.4");
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum SignatureAlgorithmIdentifier {
     RsaPss(RsaPssParameters),
+    EcdsaSha256,
+    EcdsaSha384,
+    EcdsaSha512,
     Unknown(AnyAlgorithmIdentifier),
 }
 
@@ -32,6 +40,9 @@ impl EncodeValue for SignatureAlgorithmIdentifier {
     fn value_len(&self) -> Result<Length> {
         match self {
             Self::RsaPss(_) => todo!(),
+            Self::EcdsaSha256 => ID_ECDSA_WITH_SHA256.encoded_len(),
+            Self::EcdsaSha384 => ID_ECDSA_WITH_SHA384.encoded_len(),
+            Self::EcdsaSha512 => ID_ECDSA_WITH_SHA512.encoded_len(),
             Self::Unknown(any) => any.value_len(),
         }
     }
@@ -39,6 +50,9 @@ impl EncodeValue for SignatureAlgorithmIdentifier {
     fn encode_value(&self, writer: &mut impl Writer) -> Result<()> {
         match self {
             Self::RsaPss(_) => todo!(),
+            Self::EcdsaSha256 => ID_ECDSA_WITH_SHA256.encode(writer),
+            Self::EcdsaSha384 => ID_ECDSA_WITH_SHA384.encode(writer),
+            Self::EcdsaSha512 => ID_ECDSA_WITH_SHA512.encode(writer),
             Self::Unknown(any) => any.encode(writer),
         }
     }
@@ -49,6 +63,19 @@ impl<'a> DecodeValue<'a> for SignatureAlgorithmIdentifier {
         let oid = Oid::decode(reader)?;
         Ok(match oid {
             ID_SIG_RSASSA_PSS => Self::RsaPss(RsaPssParameters::decode(reader)?),
+            ID_ECDSA_WITH_SHA256 => {
+                // ECDSA AlgorithmIdentifier has no parameters (or explicit NULL)
+                let _ = Option::<Any>::decode(reader)?;
+                Self::EcdsaSha256
+            }
+            ID_ECDSA_WITH_SHA384 => {
+                let _ = Option::<Any>::decode(reader)?;
+                Self::EcdsaSha384
+            }
+            ID_ECDSA_WITH_SHA512 => {
+                let _ = Option::<Any>::decode(reader)?;
+                Self::EcdsaSha512
+            }
             _ => Self::Unknown(AnyAlgorithmIdentifier {
                 algorithm:  oid,
                 parameters: Option::<Any>::decode(reader)?,

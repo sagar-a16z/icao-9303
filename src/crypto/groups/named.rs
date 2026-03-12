@@ -66,7 +66,7 @@ pub fn secp224r1() -> EllipticCurve<U224> {
 
 /// RFC 5114 256-bit Random ECP Group, NIST P-256, secp256r1
 pub fn secp256r1() -> EllipticCurve<U256> {
-    uint!(EllipticCurve::new(
+    uint!(EllipticCurve::new_unchecked(
         0xffffffff_00000001_00000000_00000000_00000000_ffffffff_ffffffff_ffffffff_U256,
         0xffffffff_00000001_00000000_00000000_00000000_ffffffff_ffffffff_fffffffc_U256,
         0x5ac635d8_aa3a93e7_b3ebbd55_769886bc_651d06b0_cc53b0f6_3bce3c3e_27d2604b_U256,
@@ -210,13 +210,24 @@ mod tests {
 
     #[test]
     fn test_construct() {
-        // Constuctor validates parameters and generator order.
+        // Constructor validates parameters and generator order.
+        // secp256r1() uses new_unchecked for performance, so we also
+        // validate it explicitly with new() here.
         modp_160();
         modp_224();
         modp_256();
         secp192r1();
         secp224r1();
         secp256r1();
+        uint!(EllipticCurve::new(
+            0xffffffff_00000001_00000000_00000000_00000000_ffffffff_ffffffff_ffffffff_U256,
+            0xffffffff_00000001_00000000_00000000_00000000_ffffffff_ffffffff_fffffffc_U256,
+            0x5ac635d8_aa3a93e7_b3ebbd55_769886bc_651d06b0_cc53b0f6_3bce3c3e_27d2604b_U256,
+            0x6b17d1f2_e12c4247_f8bce6e5_63a440f2_77037d81_2deb33a0_f4a13945_d898c296_U256,
+            0x4fe342e2_fe1a7f9b_8ee7eb4a_7c0f9e16_2bce3357_6b315ece_cbb64068_37bf51f5_U256,
+            0xffffffff_00000000_ffffffff_ffffffff_bce6faad_a7179e84_f3b9cac2_fc632551_U256,
+            1_U256
+        )).unwrap();
         secp384r1();
         secp521r1();
         brainpool_p160r1();
