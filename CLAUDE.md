@@ -141,6 +141,72 @@ All predicate functions auto-detect RSA vs ECDSA — use `--dataset ecdsa` to sw
 | Synthetic RSA | ✅ | ✅ (BSI) | ✅ | 1+2+3 |
 | Synthetic ECDSA | ✅ | ✅ (BSI) | ✅ | 1+2+3 |
 
+## How to run
+
+### Prerequisites
+
+```bash
+# Install Jolt CLI (needed once)
+cargo install --git https://github.com/a16z/jolt --force jolt
+
+# Generate synthetic test datasets (needed once)
+./tests/gen-synthetic-dataset.sh          # RSA-PSS-SHA256
+./tests/gen-synthetic-dataset-ecdsa.sh    # ECDSA P-256
+```
+
+### Library tests
+
+```bash
+cargo test          # 54 tests: ASN.1 parsing, RSA-PSS, ECDSA P-256, passive auth
+```
+
+### ZK proofs (from `icao-9303-jolt/`)
+
+All commands run from the `icao-9303-jolt/` directory. First run compiles the
+RISC-V guest binary (~30s); subsequent runs reuse the cached binary in
+`/tmp/jolt-guest-targets/`.
+
+**Full passport disclosure (RSA, ~17s prove time, <10 GB RAM):**
+```bash
+RUST_LOG=info cargo run --release                          # default: packed variant, synth RSA dataset
+RUST_LOG=info cargo run --release -- packed                # same as above, explicit
+RUST_LOG=info cargo run --release -- struct                # baseline: guest parses full CMS/X.509
+```
+
+**Age predicate proof (RSA, ~9s prove time):**
+```bash
+RUST_LOG=info cargo run --release -- age                   # proves holder is >= 18
+```
+
+**Nationality predicate proof (RSA, ~9s prove time):**
+```bash
+RUST_LOG=info cargo run --release -- nationality           # proves holder is German (D<<)
+```
+
+**ECDSA P-256 variants (same functions, different dataset):**
+```bash
+RUST_LOG=info cargo run --release -- age --dataset ecdsa              # ~15s prove time
+RUST_LOG=info cargo run --release -- nationality --dataset ecdsa
+RUST_LOG=info cargo run --release -- packed --dataset ecdsa
+```
+
+**Cycle analysis (no proving, prints per-section cycle counts):**
+```bash
+RUST_LOG=info cargo run --release -- analyze               # RSA dataset
+RUST_LOG=info cargo run --release -- analyze --dataset ecdsa
+```
+
+### What the verifier sees
+
+| Variant | Public inputs | Public output |
+|---------|--------------|---------------|
+| `packed`/`struct` | `disclosure_mask` | `PassportProofOutput { valid, nationality, dob, sex, expiry, csca_pubkey_hash }` |
+| `age` | `min_age`, `current_date` | `PredicateOutput { valid, predicate, csca_pubkey_hash }` |
+| `nationality` | `allowed[30]`, `allowed_count` | `PredicateOutput { valid, predicate, csca_pubkey_hash }` |
+
+The passport data (SOD, DGs, CSCA) is passed as `PrivateInput` — the verifier
+never sees it. BlindFold ZK ensures the witness is cryptographically hidden.
+
 ## What to work on (priority order)
 1. Generate synthetic RSA-4096 dataset + `verify_passport_rsa4096` provable function
 2. CSCA trust store — on-chain Merkle tree or smart contract lookup
