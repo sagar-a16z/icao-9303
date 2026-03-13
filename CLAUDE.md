@@ -10,7 +10,7 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
 - **DG hash integrity** — SHA-256 of each DG (1,2,3,4,14) checked against SOD commitments
 - **Certificate chain verification** — DS cert signed by CSCA (RSA-PSS or ECDSA, auto-detected). Outputs SHA-256 of CSCA SPKI for trust store lookup.
 - **MRZ selective disclosure** — `verify_passport_packed(disclosure_mask, passport) -> PassportProofOutput` returns only requested fields (nationality, DOB, sex, expiry, issuing state)
-- **Predicate proofs** — `check_age(min_age, current_date, ...)` and `check_nationality(allowed, ...)` auto-detect RSA/ECDSA. Only hash DG1, 57% fewer cycles than full disclosure.
+- **Predicate proofs** — `check_age(min_age, current_date, ...)` and `check_not_expired(current_date, ...)` auto-detect RSA/ECDSA. Only hash DG1, 57% fewer cycles than full disclosure.
 - **p256_fast ECDSA** — hand-tuned Solinas reduction + Montgomery scalar field. ~6M cycles (was 74M before, 2.7x RSA vs 33x before).
 - **Private passport input** — `PassportData` struct (including CSCA cert) passed as `PrivateInput<T>`, cryptographically hidden by BlindFold
 - **BlindFold ZK** — `zk` feature on host and guest; witness hidden, verifier sees only `(disclosure_mask, PassportProofOutput)`
@@ -30,7 +30,7 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
 
 ### Missing
 - **RSA-4096 in ZK guest** — library supports 4096-bit RSA, not yet wired into Jolt guest
-- **Expiry checking** — proof outputs expiry date but doesn't verify `expiry > today` inside guest
+- ~~**Expiry checking**~~ — Done. `check_not_expired(current_date, ...)` verifies `expiry >= current_date + 3 months`
 - **CSCA trust store** — verifier gets CSCA pubkey hash but no on-chain/off-chain trust store lookup yet
 - **`jolt-inlines-p256`** — constraint-native P-256 would reduce ECDSA from ~6M to ~500K cycles (requires upstream Jolt SDK work)
 
@@ -51,7 +51,7 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
   - `verify_passport_packed(mask, PrivateInput<Vec<u8>>, PrivateInput<PassportDGs>)` — host pre-parses SOD/CSCA, guest skips DER parsing
   - `verify_passport_struct(mask, PrivateInput<PassportData>)` — baseline, guest does full CMS/X.509 parsing
   - `check_age(min_age, current_date, PrivateInput<...>, PrivateInput<...>)` — DG1-only predicate proof
-  - `check_nationality(allowed, allowed_count, PrivateInput<...>, PrivateInput<...>)` — DG1-only predicate proof
+  - `check_not_expired(current_date, PrivateInput<...>, PrivateInput<...>)` — DG1-only predicate proof, checks expiry >= current_date + 3 months
 - `pack_preparsed_passport()` extracts byte fields from SOD/CSCA on host, packs with raw DG bytes
 - Guest structural integrity checks: messageDigest ↔ LDS hash, DS SPKI ↔ TBS offset
 - `PassportData` includes `sod`, `dg1-4`, `dg14`, and `csca` (all `Vec<u8>`)
@@ -69,7 +69,7 @@ Rust implementation of ICAO 9303 electronic passport (eMRTD) parsing, cryptograp
 | **Full disclosure (packed)** | 5,291,277 | 9,269,988 | 2^24 |
 | **Full disclosure (struct)** | 6,068,916 | 9,885,762 | 2^24 |
 | **Age predicate (DG1-only)** | 2,244,803 | 6,048,286 | 2^23 |
-| **Nationality predicate (DG1-only)** | ~2,245,000 | ~6,048,000 | 2^23 |
+| **Not-expired predicate (DG1-only)** | ~2,245,000 | ~6,048,000 | 2^23 |
 
 Estimated prove times (Apple M-series, single-threaded):
 
@@ -204,15 +204,15 @@ RUST_LOG=info cargo run --release -- struct                # baseline: guest par
 RUST_LOG=info cargo run --release -- age                   # proves holder is >= 18
 ```
 
-**Nationality predicate proof (RSA, ~9s prove time):**
+**Not-expired predicate proof (RSA, ~9s prove time):**
 ```bash
-RUST_LOG=info cargo run --release -- nationality           # proves holder is German (D<<)
+RUST_LOG=info cargo run --release -- not-expired           # proves expiry >= today + 3 months
 ```
 
 **ECDSA P-256 variants (same functions, different dataset):**
 ```bash
 RUST_LOG=info cargo run --release -- age --dataset ecdsa              # ~15s prove time
-RUST_LOG=info cargo run --release -- nationality --dataset ecdsa
+RUST_LOG=info cargo run --release -- not-expired --dataset ecdsa
 RUST_LOG=info cargo run --release -- packed --dataset ecdsa
 ```
 
@@ -228,7 +228,7 @@ RUST_LOG=info cargo run --release -- analyze --dataset ecdsa
 |---------|--------------|---------------|
 | `packed`/`struct` | `disclosure_mask` | `PassportProofOutput { valid, nationality, dob, sex, expiry, csca_pubkey_hash }` |
 | `age` | `min_age`, `current_date` | `PredicateOutput { valid, predicate, csca_pubkey_hash }` |
-| `nationality` | `allowed[30]`, `allowed_count` | `PredicateOutput { valid, predicate, csca_pubkey_hash }` |
+| `not-expired` | `current_date` | `PredicateOutput { valid, predicate, csca_pubkey_hash }` |
 
 The passport data (SOD, DGs, CSCA) is passed as `PrivateInput` — the verifier
 never sees it. BlindFold ZK ensures the witness is cryptographically hidden.

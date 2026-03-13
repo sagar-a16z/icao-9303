@@ -734,6 +734,22 @@ fn mrz_date_before(date: &[u8; 6], threshold: &[u8; 6]) -> bool {
     date < threshold
 }
 
+/// Add `months` to a YYMMDD date (ASCII digits). Rolls year forward if month > 12.
+fn add_months(date: &[u8; 6], months: u8) -> [u8; 6] {
+    let yy = (date[0] - b'0') * 10 + (date[1] - b'0');
+    let mm = (date[2] - b'0') * 10 + (date[3] - b'0');
+    let total_mm = mm + months;
+    let new_mm = if total_mm > 12 { total_mm - 12 } else { total_mm };
+    let new_yy = if total_mm > 12 { yy + 1 } else { yy };
+    [
+        b'0' + new_yy / 10,
+        b'0' + new_yy % 10,
+        b'0' + new_mm / 10,
+        b'0' + new_mm % 10,
+        date[4], date[5], // same day
+    ]
+}
+
 /// Predicate proof: passport holder is at least `min_age` years old.
 ///
 /// Public inputs: `min_age`, `current_date` (YYMMDD, verifier checks it matches today).
@@ -774,15 +790,13 @@ fn check_age(
     PredicateOutput { valid, predicate, csca_pubkey_hash }
 }
 
-/// Predicate proof: passport holder's nationality is in an allowed set.
+/// Predicate proof: passport is not expired (expiry >= current_date + 3 months).
 ///
-/// Public inputs: `allowed` (concatenated 3-letter codes, up to 10 countries,
-/// e.g. b"USAGBRDEU000000000000000000000"). `allowed_count` = number of codes.
-/// Output: PredicateOutput with `predicate = true` if nationality is in the set.
+/// Public inputs: `current_date` (YYMMDD as ASCII, verifier checks it matches today).
+/// Output: PredicateOutput with `predicate = true` if passport has >= 3 months validity.
 #[jolt::provable(heap_size = 0x800000, stack_size = 0x80000, max_trace_length = 0x800000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
-fn check_nationality(
-    allowed: [u8; 30],
-    allowed_count: u8,
+fn check_not_expired(
+    current_date: [u8; 6],
     preparsed_buf: jolt::PrivateInput<Vec<u8>>,
     dg1: jolt::PrivateInput<Vec<u8>>,
 ) -> PredicateOutput {
@@ -798,17 +812,14 @@ fn check_nationality(
         ds_spki_offset, csca_spki_der, &*dg1,
     );
 
-    // Check if nationality is in the allowed list (up to 10 × 3-byte codes)
-    let count = allowed_count as usize;
-    let mut predicate = false;
-    let mut i = 0;
-    while i < count && i * 3 + 3 <= allowed.len() {
-        if allowed[i * 3..i * 3 + 3] == mrz.nationality {
-            predicate = true;
-            break;
-        }
-        i += 1;
-    }
+    // Compute threshold = current_date + 3 months
+    let threshold = add_months(&current_date, 3);
+
+    // Passport is valid if expiry_date >= threshold (i.e. threshold is before or equal to expiry)
+    // Reuse mrz_date_before: predicate = true when threshold <= expiry
+    // mrz_date_before(a, b) = true when a < b, so we check !mrz_date_before(expiry, threshold)
+    // which means expiry >= threshold
+    let predicate = !mrz_date_before(&mrz.expiry_date, &threshold);
 
     PredicateOutput { valid, predicate, csca_pubkey_hash }
 }

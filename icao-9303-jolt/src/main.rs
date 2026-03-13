@@ -21,7 +21,7 @@ pub fn main() {
         "packed" => run_packed(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca),
         "struct" => run_struct(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca),
         "age" => run_age_check(&sod, &dg1, &csca),
-        "nationality" => run_nationality_check(&sod, &dg1, &csca),
+        "not-expired" => run_not_expired_check(&sod, &dg1, &csca),
         "analyze" => {
             info!("═══ PACKED (pre-parsed) ═══");
             analyze_packed(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca);
@@ -31,11 +31,14 @@ pub fn main() {
             info!("");
             info!("═══ AGE CHECK ═══");
             analyze_age(&sod, &dg1, &csca);
+            info!("");
+            info!("═══ NOT-EXPIRED CHECK ═══");
+            analyze_not_expired(&sod, &dg1, &csca);
         }
         other => {
             eprintln!("Unknown variant '{other}'.");
             eprintln!("Usage: cargo run --release [variant] [--dataset synth|ecdsa]");
-            eprintln!("Variants: packed (default), struct, age, nationality, analyze");
+            eprintln!("Variants: packed (default), struct, age, not-expired, analyze");
             std::process::exit(1);
         }
     }
@@ -117,6 +120,18 @@ fn analyze_age(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     info!("TRACE LENGTH: {}", summary.trace_len());
     summary.write_to_file("summary-age.txt".into()).expect("write");
     info!("Written to summary-age.txt");
+}
+
+fn analyze_not_expired(sod: &[u8], dg1: &[u8], csca: &[u8]) {
+    let (buf, _) = pack_preparsed_passport(sod, dg1, &[], &[], &[], &[], csca);
+    let current_date: [u8; 6] = *b"260313";
+    let summary = guest::analyze_check_not_expired(
+        current_date,
+        PrivateInput::new(buf), PrivateInput::new(dg1.to_vec()),
+    );
+    info!("TRACE LENGTH: {}", summary.trace_len());
+    summary.write_to_file("summary-not-expired.txt".into()).expect("write");
+    info!("Written to summary-not-expired.txt");
 }
 
 // ─── Prove + verify ──────────────────────────────────────────────────────────
@@ -202,37 +217,33 @@ fn run_age_check(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     print_predicate_result("Age >= 18", &output, is_valid, &io);
 }
 
-fn run_nationality_check(sod: &[u8], dg1: &[u8], csca: &[u8]) {
+fn run_not_expired_check(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     let (buf, _) = pack_preparsed_passport(sod, dg1, &[], &[], &[], &[], csca);
-
-    // Allowed nationalities: D<< (Germany — matches BSI test data)
-    let mut allowed = [0u8; 30];
-    allowed[0..3].copy_from_slice(b"D<<");
-    let allowed_count: u8 = 1;
+    let current_date: [u8; 6] = *b"260313";
 
     let target_dir = "/tmp/jolt-guest-targets";
-    let mut program = guest::compile_check_nationality(target_dir);
-    let shared = guest::preprocess_shared_check_nationality(&mut program);
-    let prover_prep = guest::preprocess_prover_check_nationality(shared.clone());
+    let mut program = guest::compile_check_not_expired(target_dir);
+    let shared = guest::preprocess_shared_check_not_expired(&mut program);
+    let prover_prep = guest::preprocess_prover_check_not_expired(shared.clone());
     let blindfold_setup = prover_prep.blindfold_setup();
-    let verifier_prep = guest::preprocess_verifier_check_nationality(
+    let verifier_prep = guest::preprocess_verifier_check_not_expired(
         shared,
         prover_prep.generators.to_verifier_setup(),
         Some(blindfold_setup),
     );
-    let prove = guest::build_prover_check_nationality(program, prover_prep);
-    let verify = guest::build_verifier_check_nationality(verifier_prep);
+    let prove = guest::build_prover_check_not_expired(program, prover_prep);
+    let verify = guest::build_verifier_check_not_expired(verifier_prep);
 
-    info!("Proving (nationality check, allowed=D<<)...");
+    info!("Proving (not-expired check, date={}, +3mo)...", std::str::from_utf8(&current_date).unwrap());
     let t = Instant::now();
     let (output, proof, io) = prove(
-        allowed, allowed_count,
+        current_date,
         PrivateInput::new(buf), PrivateInput::new(dg1.to_vec()),
     );
     info!("Prover runtime: {:.2}s", t.elapsed().as_secs_f64());
 
-    let is_valid = verify(allowed, allowed_count, output.clone(), io.panic, proof);
-    print_predicate_result("Nationality allowed", &output, is_valid, &io);
+    let is_valid = verify(current_date, output.clone(), io.panic, proof);
+    print_predicate_result("Not expired (+3mo)", &output, is_valid, &io);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
