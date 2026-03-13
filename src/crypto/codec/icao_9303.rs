@@ -3,9 +3,8 @@ use {
     super::{BsiTr031111Codec, Codec},
     crate::crypto::groups::{EllipticCurve, EllipticCurvePoint},
     anyhow::{anyhow, ensure, Result},
-    bytes::{Buf, BufMut, BytesMut},
+    bytes::{Buf, BufMut},
     const_oid::ObjectIdentifier,
-    der::Encode,
     ruint::Uint,
     tracing::warn,
 };

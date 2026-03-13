@@ -1,4 +1,7 @@
-use guest::{pack_preparsed_passport, PassportData, DISCLOSE_DOB, DISCLOSE_EXPIRY, DISCLOSE_NATIONALITY, DISCLOSE_SEX};
+use guest::{
+    pack_preparsed_passport, PassportData, DISCLOSE_DOB, DISCLOSE_EXPIRY, DISCLOSE_NATIONALITY,
+    DISCLOSE_SEX,
+};
 use jolt_sdk::PrivateInput;
 use std::time::Instant;
 use tracing::info;
@@ -56,7 +59,17 @@ fn parse_dataset_arg() -> String {
     "synth".into()
 }
 
-fn load_dataset(dataset: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+fn load_dataset(
+    dataset: &str,
+) -> (
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+) {
     match dataset {
         "synth" => {
             info!("Dataset: synthetic RSA-PSS-SHA256");
@@ -93,20 +106,46 @@ fn load_dataset(dataset: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, 
 
 // ─── Analyze (cycle counting) ────────────────────────────────────────────────
 
-fn analyze_packed(mask: u8, sod: &[u8], dg1: &[u8], dg2: &[u8], dg3: &[u8], dg4: &[u8], dg14: &[u8], csca: &[u8]) {
+fn analyze_packed(
+    mask: u8,
+    sod: &[u8],
+    dg1: &[u8],
+    dg2: &[u8],
+    dg3: &[u8],
+    dg4: &[u8],
+    dg14: &[u8],
+    csca: &[u8],
+) {
     let (buf, dgs) = pack_preparsed_passport(sod, dg1, dg2, dg3, dg4, dg14, csca);
-    info!("Pre-parsed buffer: {} bytes (+ DGs as separate struct)", buf.len());
-    let summary = guest::analyze_verify_passport_packed(mask, PrivateInput::new(buf), PrivateInput::new(dgs));
+    info!(
+        "Pre-parsed buffer: {} bytes (+ DGs as separate struct)",
+        buf.len()
+    );
+    let summary =
+        guest::analyze_verify_passport_packed(mask, PrivateInput::new(buf), PrivateInput::new(dgs));
     info!("TRACE LENGTH: {}", summary.trace_len());
-    summary.write_to_file("summary-packed.txt".into()).expect("write");
+    summary
+        .write_to_file("summary-packed.txt".into())
+        .expect("write");
     info!("Written to summary-packed.txt");
 }
 
-fn analyze_struct(mask: u8, sod: &[u8], dg1: &[u8], dg2: &[u8], dg3: &[u8], dg4: &[u8], dg14: &[u8], csca: &[u8]) {
+fn analyze_struct(
+    mask: u8,
+    sod: &[u8],
+    dg1: &[u8],
+    dg2: &[u8],
+    dg3: &[u8],
+    dg4: &[u8],
+    dg14: &[u8],
+    csca: &[u8],
+) {
     let passport = make_passport(sod, dg1, dg2, dg3, dg4, dg14, csca);
     let summary = guest::analyze_verify_passport_struct(mask, PrivateInput::new(passport));
     info!("TRACE LENGTH: {}", summary.trace_len());
-    summary.write_to_file("summary-struct.txt".into()).expect("write");
+    summary
+        .write_to_file("summary-struct.txt".into())
+        .expect("write");
     info!("Written to summary-struct.txt");
 }
 
@@ -114,11 +153,15 @@ fn analyze_age(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     let (buf, _) = pack_preparsed_passport(sod, dg1, &[], &[], &[], &[], csca);
     let current_date: [u8; 6] = *b"260312";
     let summary = guest::analyze_check_age(
-        18, current_date,
-        PrivateInput::new(buf), PrivateInput::new(dg1.to_vec()),
+        18,
+        current_date,
+        PrivateInput::new(buf),
+        PrivateInput::new(dg1.to_vec()),
     );
     info!("TRACE LENGTH: {}", summary.trace_len());
-    summary.write_to_file("summary-age.txt".into()).expect("write");
+    summary
+        .write_to_file("summary-age.txt".into())
+        .expect("write");
     info!("Written to summary-age.txt");
 }
 
@@ -127,18 +170,33 @@ fn analyze_not_expired(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     let current_date: [u8; 6] = *b"260313";
     let summary = guest::analyze_check_not_expired(
         current_date,
-        PrivateInput::new(buf), PrivateInput::new(dg1.to_vec()),
+        PrivateInput::new(buf),
+        PrivateInput::new(dg1.to_vec()),
     );
     info!("TRACE LENGTH: {}", summary.trace_len());
-    summary.write_to_file("summary-not-expired.txt".into()).expect("write");
+    summary
+        .write_to_file("summary-not-expired.txt".into())
+        .expect("write");
     info!("Written to summary-not-expired.txt");
 }
 
 // ─── Prove + verify ──────────────────────────────────────────────────────────
 
-fn run_packed(mask: u8, sod: &[u8], dg1: &[u8], dg2: &[u8], dg3: &[u8], dg4: &[u8], dg14: &[u8], csca: &[u8]) {
+fn run_packed(
+    mask: u8,
+    sod: &[u8],
+    dg1: &[u8],
+    dg2: &[u8],
+    dg3: &[u8],
+    dg4: &[u8],
+    dg14: &[u8],
+    csca: &[u8],
+) {
     let (buf, dgs) = pack_preparsed_passport(sod, dg1, dg2, dg3, dg4, dg14, csca);
-    info!("Pre-parsed buffer: {} bytes (+ DGs as separate struct)", buf.len());
+    info!(
+        "Pre-parsed buffer: {} bytes (+ DGs as separate struct)",
+        buf.len()
+    );
 
     let target_dir = "/tmp/jolt-guest-targets";
     let mut program = guest::compile_verify_passport_packed(target_dir);
@@ -162,7 +220,16 @@ fn run_packed(mask: u8, sod: &[u8], dg1: &[u8], dg2: &[u8], dg3: &[u8], dg4: &[u
     print_disclosure_result(&output, is_valid, &io);
 }
 
-fn run_struct(mask: u8, sod: &[u8], dg1: &[u8], dg2: &[u8], dg3: &[u8], dg4: &[u8], dg14: &[u8], csca: &[u8]) {
+fn run_struct(
+    mask: u8,
+    sod: &[u8],
+    dg1: &[u8],
+    dg2: &[u8],
+    dg3: &[u8],
+    dg4: &[u8],
+    dg14: &[u8],
+    csca: &[u8],
+) {
     let passport = make_passport(sod, dg1, dg2, dg3, dg4, dg14, csca);
 
     let target_dir = "/tmp/jolt-guest-targets";
@@ -205,11 +272,16 @@ fn run_age_check(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     let prove = guest::build_prover_check_age(program, prover_prep);
     let verify = guest::build_verifier_check_age(verifier_prep);
 
-    info!("Proving (age check, min_age={min_age}, date={})...", std::str::from_utf8(&current_date).unwrap());
+    info!(
+        "Proving (age check, min_age={min_age}, date={})...",
+        std::str::from_utf8(&current_date).unwrap()
+    );
     let t = Instant::now();
     let (output, proof, io) = prove(
-        min_age, current_date,
-        PrivateInput::new(buf), PrivateInput::new(dg1.to_vec()),
+        min_age,
+        current_date,
+        PrivateInput::new(buf),
+        PrivateInput::new(dg1.to_vec()),
     );
     info!("Prover runtime: {:.2}s", t.elapsed().as_secs_f64());
 
@@ -234,11 +306,15 @@ fn run_not_expired_check(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     let prove = guest::build_prover_check_not_expired(program, prover_prep);
     let verify = guest::build_verifier_check_not_expired(verifier_prep);
 
-    info!("Proving (not-expired check, date={}, +3mo)...", std::str::from_utf8(&current_date).unwrap());
+    info!(
+        "Proving (not-expired check, date={}, +3mo)...",
+        std::str::from_utf8(&current_date).unwrap()
+    );
     let t = Instant::now();
     let (output, proof, io) = prove(
         current_date,
-        PrivateInput::new(buf), PrivateInput::new(dg1.to_vec()),
+        PrivateInput::new(buf),
+        PrivateInput::new(dg1.to_vec()),
     );
     info!("Prover runtime: {:.2}s", t.elapsed().as_secs_f64());
 
@@ -248,7 +324,15 @@ fn run_not_expired_check(sod: &[u8], dg1: &[u8], csca: &[u8]) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn make_passport(sod: &[u8], dg1: &[u8], dg2: &[u8], dg3: &[u8], dg4: &[u8], dg14: &[u8], csca: &[u8]) -> PassportData {
+fn make_passport(
+    sod: &[u8],
+    dg1: &[u8],
+    dg2: &[u8],
+    dg3: &[u8],
+    dg4: &[u8],
+    dg14: &[u8],
+    csca: &[u8],
+) -> PassportData {
     PassportData {
         sod: sod.to_vec(),
         dg1: dg1.to_vec(),
@@ -260,20 +344,48 @@ fn make_passport(sod: &[u8], dg1: &[u8], dg2: &[u8], dg3: &[u8], dg4: &[u8], dg1
     }
 }
 
-fn print_disclosure_result(output: &guest::PassportProofOutput, is_valid: bool, io: &jolt_sdk::JoltDevice) {
+fn print_disclosure_result(
+    output: &guest::PassportProofOutput,
+    is_valid: bool,
+    io: &jolt_sdk::JoltDevice,
+) {
     info!("Passport valid:        {}", output.valid);
-    info!("Disclosed nationality: {}", std::str::from_utf8(&output.nationality).unwrap_or("N/A"));
-    info!("Disclosed DOB:         {}", std::str::from_utf8(&output.date_of_birth).unwrap_or("N/A"));
-    info!("Disclosed sex:         {}", if output.sex != 0 { output.sex as char } else { '-' });
-    info!("Disclosed expiry:      {}", std::str::from_utf8(&output.expiry_date).unwrap_or("N/A"));
-    info!("CSCA pubkey hash:      {}", hex::encode(output.csca_pubkey_hash));
+    info!(
+        "Disclosed nationality: {}",
+        std::str::from_utf8(&output.nationality).unwrap_or("N/A")
+    );
+    info!(
+        "Disclosed DOB:         {}",
+        std::str::from_utf8(&output.date_of_birth).unwrap_or("N/A")
+    );
+    info!(
+        "Disclosed sex:         {}",
+        if output.sex != 0 {
+            output.sex as char
+        } else {
+            '-'
+        }
+    );
+    info!(
+        "Disclosed expiry:      {}",
+        std::str::from_utf8(&output.expiry_date).unwrap_or("N/A")
+    );
+    info!(
+        "CSCA pubkey hash:      {}",
+        hex::encode(output.csca_pubkey_hash)
+    );
     info!("Proof valid:           {is_valid}");
     assert!(!io.panic, "guest panicked");
     assert!(output.valid, "Passport verification failed");
     assert!(is_valid, "Jolt proof verification failed");
 }
 
-fn print_predicate_result(label: &str, output: &guest::PredicateOutput, is_valid: bool, io: &jolt_sdk::JoltDevice) {
+fn print_predicate_result(
+    label: &str,
+    output: &guest::PredicateOutput,
+    is_valid: bool,
+    io: &jolt_sdk::JoltDevice,
+) {
     info!("Chain valid:      {}", output.valid);
     info!("{label}:  {}", output.predicate);
     info!("CSCA pubkey hash: {}", hex::encode(output.csca_pubkey_hash));

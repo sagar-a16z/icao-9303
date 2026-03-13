@@ -134,7 +134,8 @@ impl<'a, const BITS: usize, const LIMBS: usize> Codec<EllipticCurvePoint<'a, Uin
 #[cfg(test)]
 mod tests {
     use {
-        super::{super::BufCodecParent, *},
+        super::super::buf::BufCodecParent,
+        super::*,
         crate::crypto::groups::named::brainpool_p256r1,
         hex_literal::hex,
     };

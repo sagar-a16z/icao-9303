@@ -4,10 +4,9 @@ use icao_9303::{
     asn1::{
         emrtd::{mrz::MrzRaw, EfSod, LdsSecurityObject},
         public_key_info::SubjectPublicKeyInfo,
-        DigestAlgorithmIdentifier,
-        SignatureAlgorithmIdentifier,
+        DigestAlgorithmIdentifier, SignatureAlgorithmIdentifier,
     },
-    crypto::{p256_fast::verify_ecdsa_p256_fast, mod_ring::RingRefExt, rsa::RSAPublicKey},
+    crypto::{mod_ring::RingRefExt, p256_fast::verify_ecdsa_p256_fast, rsa::RSAPublicKey},
 };
 use jolt::{end_cycle_tracking, start_cycle_tracking};
 use ruint::Uint;
@@ -95,7 +94,7 @@ fn pack_field(buf: &mut Vec<u8>, field: &[u8]) {
     buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
     buf.extend_from_slice(field);
     let pad = (4 - (field.len() % 4)) % 4;
-    buf.extend(core::iter::repeat(0u8).take(pad));
+    buf.extend(core::iter::repeat_n(0u8, pad));
 }
 
 /// Take a length-prefixed, 4-byte-aligned slice from the buffer.
@@ -173,7 +172,11 @@ pub fn pack_preparsed_passport(
     let signature_bytes = signer.signature.as_bytes();
 
     // DS certificate
-    let certs = sod.signed_data().certificates.as_ref().expect("no certs in SOD");
+    let certs = sod
+        .signed_data()
+        .certificates
+        .as_ref()
+        .expect("no certs in SOD");
     let ds_cert = match certs.0.iter().next().unwrap() {
         CertificateChoices::Certificate(c) => c,
         _ => panic!("unexpected certificate type"),
@@ -218,17 +221,17 @@ pub fn pack_preparsed_passport(
 
     // ── Pack pre-parsed fields (no DG data) ─────────────────────────────────
     let mut buf = Vec::new();
-    pack_field(&mut buf, &signed_attrs_der);     // 0
-    pack_field(&mut buf, &digest_alg_der);       // 1
-    pack_field(&mut buf, &sig_algo_der);         // 2
-    pack_field(&mut buf, signature_bytes);        // 3
-    pack_field(&mut buf, &ds_spki_der);          // 4
-    pack_field(&mut buf, &lds_der);              // 5
-    pack_field(&mut buf, &tbs_der);              // 6
-    pack_field(&mut buf, cert_sig_bytes);         // 7
-    pack_field(&mut buf, &cert_sig_algo_der);    // 8
-    pack_field(&mut buf, &csca_spki_der);        // 9
-    // Append ds_spki_offset as raw u32 (no length prefix)
+    pack_field(&mut buf, &signed_attrs_der); // 0
+    pack_field(&mut buf, &digest_alg_der); // 1
+    pack_field(&mut buf, &sig_algo_der); // 2
+    pack_field(&mut buf, signature_bytes); // 3
+    pack_field(&mut buf, &ds_spki_der); // 4
+    pack_field(&mut buf, &lds_der); // 5
+    pack_field(&mut buf, &tbs_der); // 6
+    pack_field(&mut buf, cert_sig_bytes); // 7
+    pack_field(&mut buf, &cert_sig_algo_der); // 8
+    pack_field(&mut buf, &csca_spki_der); // 9
+                                          // Append ds_spki_offset as raw u32 (no length prefix)
     buf.extend_from_slice(&ds_spki_offset.to_le_bytes());
 
     let dgs = PassportDGs {
@@ -302,21 +305,14 @@ fn verify_passport_preparsed(
 
     start_cycle_tracking("dg_hash_verify");
     let dg_hashes_valid = lso
-        .verify_dg_hashes(&[
-            (1, dg1),
-            (2, dg2),
-            (3, dg3),
-            (4, dg4),
-            (14, dg14),
-        ])
+        .verify_dg_hashes(&[(1, dg1), (2, dg2), (3, dg3), (4, dg4), (14, dg14)])
         .is_ok();
     end_cycle_tracking("dg_hash_verify");
 
     // ── 6. CSCA public key hash ───────────────────────────────────────────
     start_cycle_tracking("csca_hash");
-    let csca_digest = DigestAlgorithmIdentifier::Sha256(
-        icao_9303::asn1::DigestAlgorithmParameters::Null,
-    );
+    let csca_digest =
+        DigestAlgorithmIdentifier::Sha256(icao_9303::asn1::DigestAlgorithmParameters::Null);
     let csca_pubkey_hash_vec = csca_digest.hash_bytes(csca_spki_der);
     let mut csca_pubkey_hash = [0u8; 32];
     csca_pubkey_hash.copy_from_slice(&csca_pubkey_hash_vec);
@@ -327,7 +323,12 @@ fn verify_passport_preparsed(
     let cert_sig_algo = SignatureAlgorithmIdentifier::from_der(cert_sig_algo_der).unwrap();
     let cert_digest_algo = cert_sig_algo.digest_algorithm();
     let cert_message_hash = cert_digest_algo.hash_bytes(tbs_der);
-    let cert_chain_valid = verify_signature(&csca_spki, &cert_sig_algo, cert_sig_bytes, &cert_message_hash);
+    let cert_chain_valid = verify_signature(
+        &csca_spki,
+        &cert_sig_algo,
+        cert_sig_bytes,
+        &cert_message_hash,
+    );
 
     let valid = structural_valid && sig_valid && dg_hashes_valid && cert_chain_valid;
 
@@ -339,11 +340,31 @@ fn verify_passport_preparsed(
     PassportProofOutput {
         valid,
         disclosure_mask,
-        issuing_state: if disclosure_mask & DISCLOSE_ISSUING_STATE != 0 { mrz.issuing_state } else { [0; 3] },
-        nationality: if disclosure_mask & DISCLOSE_NATIONALITY != 0 { mrz.nationality } else { [0; 3] },
-        date_of_birth: if disclosure_mask & DISCLOSE_DOB != 0 { mrz.date_of_birth } else { [0; 6] },
-        sex: if disclosure_mask & DISCLOSE_SEX != 0 { mrz.sex } else { 0 },
-        expiry_date: if disclosure_mask & DISCLOSE_EXPIRY != 0 { mrz.expiry_date } else { [0; 6] },
+        issuing_state: if disclosure_mask & DISCLOSE_ISSUING_STATE != 0 {
+            mrz.issuing_state
+        } else {
+            [0; 3]
+        },
+        nationality: if disclosure_mask & DISCLOSE_NATIONALITY != 0 {
+            mrz.nationality
+        } else {
+            [0; 3]
+        },
+        date_of_birth: if disclosure_mask & DISCLOSE_DOB != 0 {
+            mrz.date_of_birth
+        } else {
+            [0; 6]
+        },
+        sex: if disclosure_mask & DISCLOSE_SEX != 0 {
+            mrz.sex
+        } else {
+            0
+        },
+        expiry_date: if disclosure_mask & DISCLOSE_EXPIRY != 0 {
+            mrz.expiry_date
+        } else {
+            [0; 6]
+        },
         csca_pubkey_hash,
     }
 }
@@ -357,7 +378,9 @@ fn verify_passport_preparsed(
 fn extract_message_digest(signed_attrs_der: &[u8]) -> Option<&[u8]> {
     // id-messageDigest OID: 1.2.840.113549.1.9.4
     // DER encoding: 06 09 2A 86 48 86 F7 0D 01 09 04
-    const MSG_DIGEST_OID: [u8; 11] = [0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04];
+    const MSG_DIGEST_OID: [u8; 11] = [
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x09, 0x04,
+    ];
 
     // Find the OID in the signed_attrs DER
     let pos = signed_attrs_der
@@ -428,10 +451,7 @@ fn verify_passport_inner(
 
     // ── 2. Hash signed attributes (RFC 5652 §5.4) ─────────────────────────
     start_cycle_tracking("hash_signed_attrs");
-    let digest = DigestAlgorithmIdentifier::from_der(
-        &signer.digest_alg.to_der().unwrap(),
-    )
-    .unwrap();
+    let digest = DigestAlgorithmIdentifier::from_der(&signer.digest_alg.to_der().unwrap()).unwrap();
     let message_hash = if let Some(signed_attrs) = &signer.signed_attrs {
         digest.hash_bytes(&signed_attrs.to_der().unwrap())
     } else {
@@ -446,59 +466,63 @@ fn verify_passport_inner(
         CertificateChoices::Certificate(c) => c,
         _ => panic!("unexpected certificate type"),
     };
-    let spki_der = ds_cert.tbs_certificate.subject_public_key_info.to_der().unwrap();
+    let spki_der = ds_cert
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .unwrap();
     let spki = SubjectPublicKeyInfo::from_der(&spki_der).unwrap();
     end_cycle_tracking("extract_cert");
 
     // ── 4. SOD signature verification (auto-detect RSA vs ECDSA) ────────────
-    let sig_algo = SignatureAlgorithmIdentifier::from_der(
-        &signer.signature_algorithm.to_der().unwrap(),
-    )
-    .unwrap();
+    let sig_algo =
+        SignatureAlgorithmIdentifier::from_der(&signer.signature_algorithm.to_der().unwrap())
+            .unwrap();
     let sig_valid = verify_signature(&spki, &sig_algo, signer.signature.as_bytes(), &message_hash);
 
     // ── 5. Data group hash verification ─────────────────────────────────────
     start_cycle_tracking("dg_hash_verify");
     let lso = sod.lds_security_object().unwrap();
     let dg_hashes_valid = lso
-        .verify_dg_hashes(&[
-            (1, dg1),
-            (2, dg2),
-            (3, dg3),
-            (4, dg4),
-            (14, dg14),
-        ])
+        .verify_dg_hashes(&[(1, dg1), (2, dg2), (3, dg3), (4, dg4), (14, dg14)])
         .is_ok();
     end_cycle_tracking("dg_hash_verify");
 
     // ── 6. Certificate chain: DS cert signed by CSCA ────────────────────────
     start_cycle_tracking("parse_csca");
     let csca = x509_cert::Certificate::from_der(csca_bytes).unwrap();
-    let csca_spki_der = csca.tbs_certificate.subject_public_key_info.to_der().unwrap();
+    let csca_spki_der = csca
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .unwrap();
     let csca_spki = SubjectPublicKeyInfo::from_der(&csca_spki_der).unwrap();
     end_cycle_tracking("parse_csca");
 
     start_cycle_tracking("csca_hash");
-    let csca_digest = DigestAlgorithmIdentifier::Sha256(
-        icao_9303::asn1::DigestAlgorithmParameters::Null,
-    );
+    let csca_digest =
+        DigestAlgorithmIdentifier::Sha256(icao_9303::asn1::DigestAlgorithmParameters::Null);
     let csca_pubkey_hash_vec = csca_digest.hash_bytes(&csca_spki_der);
     let mut csca_pubkey_hash = [0u8; 32];
     csca_pubkey_hash.copy_from_slice(&csca_pubkey_hash_vec);
     end_cycle_tracking("csca_hash");
 
     let tbs_der = ds_cert.tbs_certificate.to_der().unwrap();
-    let cert_sig_algo = SignatureAlgorithmIdentifier::from_der(
-        &ds_cert.signature_algorithm.to_der().unwrap(),
-    )
-    .unwrap();
+    let cert_sig_algo =
+        SignatureAlgorithmIdentifier::from_der(&ds_cert.signature_algorithm.to_der().unwrap())
+            .unwrap();
     let cert_digest_algo = cert_sig_algo.digest_algorithm();
     let cert_message_hash = cert_digest_algo.hash_bytes(&tbs_der);
     let cert_sig_bytes = ds_cert
         .signature
         .as_bytes()
         .expect("cert signature not a bit string");
-    let cert_chain_valid = verify_signature(&csca_spki, &cert_sig_algo, cert_sig_bytes, &cert_message_hash);
+    let cert_chain_valid = verify_signature(
+        &csca_spki,
+        &cert_sig_algo,
+        cert_sig_bytes,
+        &cert_message_hash,
+    );
 
     let valid = sig_valid && dg_hashes_valid && cert_chain_valid;
 
@@ -510,11 +534,31 @@ fn verify_passport_inner(
     PassportProofOutput {
         valid,
         disclosure_mask,
-        issuing_state: if disclosure_mask & DISCLOSE_ISSUING_STATE != 0 { mrz.issuing_state } else { [0; 3] },
-        nationality: if disclosure_mask & DISCLOSE_NATIONALITY != 0 { mrz.nationality } else { [0; 3] },
-        date_of_birth: if disclosure_mask & DISCLOSE_DOB != 0 { mrz.date_of_birth } else { [0; 6] },
-        sex: if disclosure_mask & DISCLOSE_SEX != 0 { mrz.sex } else { 0 },
-        expiry_date: if disclosure_mask & DISCLOSE_EXPIRY != 0 { mrz.expiry_date } else { [0; 6] },
+        issuing_state: if disclosure_mask & DISCLOSE_ISSUING_STATE != 0 {
+            mrz.issuing_state
+        } else {
+            [0; 3]
+        },
+        nationality: if disclosure_mask & DISCLOSE_NATIONALITY != 0 {
+            mrz.nationality
+        } else {
+            [0; 3]
+        },
+        date_of_birth: if disclosure_mask & DISCLOSE_DOB != 0 {
+            mrz.date_of_birth
+        } else {
+            [0; 6]
+        },
+        sex: if disclosure_mask & DISCLOSE_SEX != 0 {
+            mrz.sex
+        } else {
+            0
+        },
+        expiry_date: if disclosure_mask & DISCLOSE_EXPIRY != 0 {
+            mrz.expiry_date
+        } else {
+            [0; 6]
+        },
         csca_pubkey_hash,
     }
 }
@@ -526,8 +570,18 @@ fn verify_passport_inner(
 ///
 /// DGs are passed as a separate `PrivateInput<PassportDGs>` so each DG gets
 /// its own aligned heap allocation (fixes jolt-inlines-sha2 LW alignment regression).
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x1000000, max_output_size = 64, max_untrusted_advice_size = 0x10000)]
-fn verify_passport_packed(disclosure_mask: u8, preparsed_buf: jolt::PrivateInput<Vec<u8>>, dgs: jolt::PrivateInput<PassportDGs>) -> PassportProofOutput {
+#[jolt::provable(
+    heap_size = 0x800000,
+    stack_size = 0x40000,
+    max_trace_length = 0x1000000,
+    max_output_size = 64,
+    max_untrusted_advice_size = 0x10000
+)]
+fn verify_passport_packed(
+    disclosure_mask: u8,
+    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
+    dgs: jolt::PrivateInput<PassportDGs>,
+) -> PassportProofOutput {
     let buf = &*preparsed_buf;
 
     // Unpack pre-parsed SOD/CSCA fields
@@ -559,14 +613,27 @@ fn verify_passport_packed(disclosure_mask: u8, preparsed_buf: jolt::PrivateInput
         cert_sig_algo_der,
         ds_spki_offset,
         csca_spki_der,
-        &dgs.dg1, &dgs.dg2, &dgs.dg3, &dgs.dg4, &dgs.dg14,
+        &dgs.dg1,
+        &dgs.dg2,
+        &dgs.dg3,
+        &dgs.dg4,
+        &dgs.dg14,
     )
 }
 
 /// Baseline struct variant — Jolt macro postcard-deserializes the struct,
 /// guest does full CMS/X.509 DER parsing.
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x40000, max_trace_length = 0x1000000, max_output_size = 64, max_untrusted_advice_size = 0x10000)]
-fn verify_passport_struct(disclosure_mask: u8, passport: jolt::PrivateInput<PassportData>) -> PassportProofOutput {
+#[jolt::provable(
+    heap_size = 0x800000,
+    stack_size = 0x40000,
+    max_trace_length = 0x1000000,
+    max_output_size = 64,
+    max_untrusted_advice_size = 0x10000
+)]
+fn verify_passport_struct(
+    disclosure_mask: u8,
+    passport: jolt::PrivateInput<PassportData>,
+) -> PassportProofOutput {
     let passport = &*passport;
 
     verify_passport_inner(
@@ -636,9 +703,8 @@ fn verify_passport_dg1_only(
 
     // ── 5. CSCA public key hash ─────────────────────────────────────────
     start_cycle_tracking("csca_hash");
-    let csca_digest = DigestAlgorithmIdentifier::Sha256(
-        icao_9303::asn1::DigestAlgorithmParameters::Null,
-    );
+    let csca_digest =
+        DigestAlgorithmIdentifier::Sha256(icao_9303::asn1::DigestAlgorithmParameters::Null);
     let csca_pubkey_hash_vec = csca_digest.hash_bytes(csca_spki_der);
     let mut csca_pubkey_hash = [0u8; 32];
     csca_pubkey_hash.copy_from_slice(&csca_pubkey_hash_vec);
@@ -649,7 +715,12 @@ fn verify_passport_dg1_only(
     let cert_sig_algo = SignatureAlgorithmIdentifier::from_der(cert_sig_algo_der).unwrap();
     let cert_digest_algo = cert_sig_algo.digest_algorithm();
     let cert_message_hash = cert_digest_algo.hash_bytes(tbs_der);
-    let cert_chain_valid = verify_signature(&csca_spki, &cert_sig_algo, cert_sig_bytes, &cert_message_hash);
+    let cert_chain_valid = verify_signature(
+        &csca_spki,
+        &cert_sig_algo,
+        cert_sig_bytes,
+        &cert_message_hash,
+    );
 
     let valid = structural_valid && sig_valid && dg1_hash_valid && cert_chain_valid;
 
@@ -687,7 +758,8 @@ fn verify_signature(
         }
         SubjectPublicKeyInfo::Ec(ec) => {
             start_cycle_tracking("ecdsa_verify");
-            let valid = verify_ecdsa_p256_fast(message_hash, signature_bytes, ec.point.as_bytes()).is_ok();
+            let valid =
+                verify_ecdsa_p256_fast(message_hash, signature_bytes, ec.point.as_bytes()).is_ok();
             end_cycle_tracking("ecdsa_verify");
             valid
         }
@@ -696,8 +768,20 @@ fn verify_signature(
 }
 
 /// Unpack pre-parsed buffer fields (shared by all predicate provable functions).
-fn unpack_preparsed(buf: &[u8]) -> (
-    &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], &[u8], u32
+fn unpack_preparsed(
+    buf: &[u8],
+) -> (
+    &[u8],
+    &[u8],
+    &[u8],
+    &[u8],
+    &[u8],
+    &[u8],
+    &[u8],
+    &[u8],
+    &[u8],
+    &[u8],
+    u32,
 ) {
     let (signed_attrs_der, buf) = take_slice(buf);
     let (digest_alg_der, buf) = take_slice(buf);
@@ -711,9 +795,17 @@ fn unpack_preparsed(buf: &[u8]) -> (
     let (csca_spki_der, buf) = take_slice(buf);
     let (ds_spki_offset, _) = take_u32(buf);
     (
-        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
-        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
-        csca_spki_der, ds_spki_offset,
+        signed_attrs_der,
+        digest_alg_der,
+        sig_algo_der,
+        signature_bytes,
+        ds_spki_der,
+        lds_der,
+        tbs_der,
+        cert_sig_bytes,
+        cert_sig_algo_der,
+        csca_spki_der,
+        ds_spki_offset,
     )
 }
 
@@ -739,14 +831,19 @@ fn add_months(date: &[u8; 6], months: u8) -> [u8; 6] {
     let yy = (date[0] - b'0') * 10 + (date[1] - b'0');
     let mm = (date[2] - b'0') * 10 + (date[3] - b'0');
     let total_mm = mm + months;
-    let new_mm = if total_mm > 12 { total_mm - 12 } else { total_mm };
+    let new_mm = if total_mm > 12 {
+        total_mm - 12
+    } else {
+        total_mm
+    };
     let new_yy = if total_mm > 12 { yy + 1 } else { yy };
     [
         b'0' + new_yy / 10,
         b'0' + new_yy % 10,
         b'0' + new_mm / 10,
         b'0' + new_mm % 10,
-        date[4], date[5], // same day
+        date[4],
+        date[5], // same day
     ]
 }
 
@@ -755,7 +852,13 @@ fn add_months(date: &[u8; 6], months: u8) -> [u8; 6] {
 /// Public inputs: `min_age`, `current_date` (YYMMDD, verifier checks it matches today).
 /// Output: PredicateOutput with `predicate = true` if holder is >= min_age.
 /// Only hashes DG1 — skips DG2-4/14 for ~50% cycle savings.
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x80000, max_trace_length = 0x800000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
+#[jolt::provable(
+    heap_size = 0x800000,
+    stack_size = 0x80000,
+    max_trace_length = 0x800000,
+    max_output_size = 48,
+    max_untrusted_advice_size = 0x10000
+)]
 fn check_age(
     min_age: u8,
     current_date: [u8; 6],
@@ -763,15 +866,32 @@ fn check_age(
     dg1: jolt::PrivateInput<Vec<u8>>,
 ) -> PredicateOutput {
     let (
-        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
-        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
-        csca_spki_der, ds_spki_offset,
-    ) = unpack_preparsed(&*preparsed_buf);
+        signed_attrs_der,
+        digest_alg_der,
+        sig_algo_der,
+        signature_bytes,
+        ds_spki_der,
+        lds_der,
+        tbs_der,
+        cert_sig_bytes,
+        cert_sig_algo_der,
+        csca_spki_der,
+        ds_spki_offset,
+    ) = unpack_preparsed(&preparsed_buf);
 
     let (valid, mrz, csca_pubkey_hash) = verify_passport_dg1_only(
-        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
-        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
-        ds_spki_offset, csca_spki_der, &*dg1,
+        signed_attrs_der,
+        digest_alg_der,
+        sig_algo_der,
+        signature_bytes,
+        ds_spki_der,
+        lds_der,
+        tbs_der,
+        cert_sig_bytes,
+        cert_sig_algo_der,
+        ds_spki_offset,
+        csca_spki_der,
+        &dg1,
     );
 
     // Compute threshold date: current_date - min_age years
@@ -781,35 +901,64 @@ fn check_age(
     let threshold: [u8; 6] = [
         b'0' + thresh_yy / 10,
         b'0' + thresh_yy % 10,
-        current_date[2], current_date[3], // same month
-        current_date[4], current_date[5], // same day
+        current_date[2],
+        current_date[3], // same month
+        current_date[4],
+        current_date[5], // same day
     ];
 
     let predicate = mrz_date_before(&mrz.date_of_birth, &threshold);
 
-    PredicateOutput { valid, predicate, csca_pubkey_hash }
+    PredicateOutput {
+        valid,
+        predicate,
+        csca_pubkey_hash,
+    }
 }
 
 /// Predicate proof: passport is not expired (expiry >= current_date + 3 months).
 ///
 /// Public inputs: `current_date` (YYMMDD as ASCII, verifier checks it matches today).
 /// Output: PredicateOutput with `predicate = true` if passport has >= 3 months validity.
-#[jolt::provable(heap_size = 0x800000, stack_size = 0x80000, max_trace_length = 0x800000, max_output_size = 48, max_untrusted_advice_size = 0x10000)]
+#[jolt::provable(
+    heap_size = 0x800000,
+    stack_size = 0x80000,
+    max_trace_length = 0x800000,
+    max_output_size = 48,
+    max_untrusted_advice_size = 0x10000
+)]
 fn check_not_expired(
     current_date: [u8; 6],
     preparsed_buf: jolt::PrivateInput<Vec<u8>>,
     dg1: jolt::PrivateInput<Vec<u8>>,
 ) -> PredicateOutput {
     let (
-        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
-        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
-        csca_spki_der, ds_spki_offset,
-    ) = unpack_preparsed(&*preparsed_buf);
+        signed_attrs_der,
+        digest_alg_der,
+        sig_algo_der,
+        signature_bytes,
+        ds_spki_der,
+        lds_der,
+        tbs_der,
+        cert_sig_bytes,
+        cert_sig_algo_der,
+        csca_spki_der,
+        ds_spki_offset,
+    ) = unpack_preparsed(&preparsed_buf);
 
     let (valid, mrz, csca_pubkey_hash) = verify_passport_dg1_only(
-        signed_attrs_der, digest_alg_der, sig_algo_der, signature_bytes,
-        ds_spki_der, lds_der, tbs_der, cert_sig_bytes, cert_sig_algo_der,
-        ds_spki_offset, csca_spki_der, &*dg1,
+        signed_attrs_der,
+        digest_alg_der,
+        sig_algo_der,
+        signature_bytes,
+        ds_spki_der,
+        lds_der,
+        tbs_der,
+        cert_sig_bytes,
+        cert_sig_algo_der,
+        ds_spki_offset,
+        csca_spki_der,
+        &dg1,
     );
 
     // Compute threshold = current_date + 3 months
@@ -821,6 +970,9 @@ fn check_not_expired(
     // which means expiry >= threshold
     let predicate = !mrz_date_before(&mrz.expiry_date, &threshold);
 
-    PredicateOutput { valid, predicate, csca_pubkey_hash }
+    PredicateOutput {
+        valid,
+        predicate,
+        csca_pubkey_hash,
+    }
 }
-
