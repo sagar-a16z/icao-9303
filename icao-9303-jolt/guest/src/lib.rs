@@ -567,40 +567,25 @@ fn verify_passport_inner(
 
 // ─── Provable functions ─────────────────────────────────────────────────────
 
-/// Pre-parsed variant — host extracts byte fields from SOD/CSCA,
-/// guest skips all CMS/X.509 DER parsing.
-///
-/// DGs are passed as a separate `PrivateInput<PassportDGs>` so each DG gets
-/// its own aligned heap allocation (fixes jolt-inlines-sha2 LW alignment regression).
-#[jolt::provable(
-    heap_size = 0x800000,
-    stack_size = 0x40000,
-    max_trace_length = 0x1000000,
-    max_output_size = 64,
-    max_untrusted_advice_size = 0x10000
-)]
-fn verify_passport_packed(
+/// Inner body shared by packed provable functions (ECDSA and RSA variants).
+fn verify_passport_packed_inner(
     disclosure_mask: u8,
-    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
-    dgs: jolt::PrivateInput<PassportDGs>,
+    preparsed_buf: &[u8],
+    dgs: &PassportDGs,
 ) -> PassportProofOutput {
-    let buf = &*preparsed_buf;
-
-    // Unpack pre-parsed SOD/CSCA fields
-    let (signed_attrs_der, buf) = take_slice(buf);
-    let (digest_alg_der, buf) = take_slice(buf);
-    let (sig_algo_der, buf) = take_slice(buf);
-    let (signature_bytes, buf) = take_slice(buf);
-    let (ds_spki_der, buf) = take_slice(buf);
-    let (lds_der, buf) = take_slice(buf);
-    let (tbs_der, buf) = take_slice(buf);
-    let (cert_sig_bytes, buf) = take_slice(buf);
-    let (cert_sig_algo_der, buf) = take_slice(buf);
-    let (csca_spki_der, buf) = take_slice(buf);
-    let (ds_spki_offset, _) = take_u32(buf);
-
-    // DGs come from separate PrivateInput — each Vec has its own aligned allocation
-    let dgs = &*dgs;
+    let (
+        signed_attrs_der,
+        digest_alg_der,
+        sig_algo_der,
+        signature_bytes,
+        ds_spki_der,
+        lds_der,
+        tbs_der,
+        cert_sig_bytes,
+        cert_sig_algo_der,
+        csca_spki_der,
+        ds_spki_offset,
+    ) = unpack_preparsed(preparsed_buf);
 
     verify_passport_preparsed(
         disclosure_mask,
@@ -621,6 +606,22 @@ fn verify_passport_packed(
         &dgs.dg4,
         &dgs.dg14,
     )
+}
+
+/// Pre-parsed ECDSA variant — trace length sized for ECDSA P-256 (~9.3M cycles).
+#[jolt::provable(
+    heap_size = 0x800000,
+    stack_size = 0x40000,
+    max_trace_length = 0x1000000,
+    max_output_size = 64,
+    max_untrusted_advice_size = 0x10000
+)]
+fn verify_passport_packed(
+    disclosure_mask: u8,
+    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
+    dgs: jolt::PrivateInput<PassportDGs>,
+) -> PassportProofOutput {
+    verify_passport_packed_inner(disclosure_mask, &preparsed_buf, &dgs)
 }
 
 /// Baseline struct variant — Jolt macro postcard-deserializes the struct,
@@ -927,11 +928,64 @@ fn add_months(date: &[u8; 6], months: u8) -> [u8; 6] {
     ]
 }
 
-/// Predicate proof: passport holder is at least `min_age` years old.
-///
-/// Public inputs: `min_age`, `current_date` (YYMMDD, verifier checks it matches today).
-/// Output: PredicateOutput with `predicate = true` if holder is >= min_age.
-/// Only hashes DG1 — skips DG2-4/14 for ~50% cycle savings.
+/// Inner body shared by check_age provable functions.
+fn check_age_inner(
+    min_age: u8,
+    current_date: [u8; 6],
+    preparsed_buf: &[u8],
+    dg1: &[u8],
+) -> PredicateOutput {
+    let (
+        signed_attrs_der,
+        digest_alg_der,
+        sig_algo_der,
+        signature_bytes,
+        ds_spki_der,
+        lds_der,
+        tbs_der,
+        cert_sig_bytes,
+        cert_sig_algo_der,
+        csca_spki_der,
+        ds_spki_offset,
+    ) = unpack_preparsed(preparsed_buf);
+
+    let (valid, mrz, csca_pubkey_hash) = verify_passport_dg1_only(
+        signed_attrs_der,
+        digest_alg_der,
+        sig_algo_der,
+        signature_bytes,
+        ds_spki_der,
+        lds_der,
+        tbs_der,
+        cert_sig_bytes,
+        cert_sig_algo_der,
+        ds_spki_offset,
+        csca_spki_der,
+        dg1,
+    );
+
+    // Compute threshold date: current_date - min_age years
+    let cur_yy = (current_date[0] - b'0') * 10 + (current_date[1] - b'0');
+    let thresh_yy = cur_yy.wrapping_sub(min_age);
+    let threshold: [u8; 6] = [
+        b'0' + thresh_yy / 10,
+        b'0' + thresh_yy % 10,
+        current_date[2],
+        current_date[3],
+        current_date[4],
+        current_date[5],
+    ];
+
+    let predicate = mrz_date_before(&mrz.date_of_birth, &threshold);
+
+    PredicateOutput {
+        valid,
+        predicate,
+        csca_pubkey_hash,
+    }
+}
+
+/// ECDSA age predicate — trace length sized for ECDSA P-256 (~6M cycles).
 #[jolt::provable(
     heap_size = 0x800000,
     stack_size = 0x80000,
@@ -945,72 +999,14 @@ fn check_age(
     preparsed_buf: jolt::PrivateInput<Vec<u8>>,
     dg1: jolt::PrivateInput<Vec<u8>>,
 ) -> PredicateOutput {
-    let (
-        signed_attrs_der,
-        digest_alg_der,
-        sig_algo_der,
-        signature_bytes,
-        ds_spki_der,
-        lds_der,
-        tbs_der,
-        cert_sig_bytes,
-        cert_sig_algo_der,
-        csca_spki_der,
-        ds_spki_offset,
-    ) = unpack_preparsed(&preparsed_buf);
-
-    let (valid, mrz, csca_pubkey_hash) = verify_passport_dg1_only(
-        signed_attrs_der,
-        digest_alg_der,
-        sig_algo_der,
-        signature_bytes,
-        ds_spki_der,
-        lds_der,
-        tbs_der,
-        cert_sig_bytes,
-        cert_sig_algo_der,
-        ds_spki_offset,
-        csca_spki_der,
-        &dg1,
-    );
-
-    // Compute threshold date: current_date - min_age years
-    // YYMMDD subtraction: subtract min_age from year, keep month/day
-    let cur_yy = (current_date[0] - b'0') * 10 + (current_date[1] - b'0');
-    let thresh_yy = cur_yy.wrapping_sub(min_age);
-    let threshold: [u8; 6] = [
-        b'0' + thresh_yy / 10,
-        b'0' + thresh_yy % 10,
-        current_date[2],
-        current_date[3], // same month
-        current_date[4],
-        current_date[5], // same day
-    ];
-
-    let predicate = mrz_date_before(&mrz.date_of_birth, &threshold);
-
-    PredicateOutput {
-        valid,
-        predicate,
-        csca_pubkey_hash,
-    }
+    check_age_inner(min_age, current_date, &preparsed_buf, &dg1)
 }
 
-/// Predicate proof: passport is not expired (expiry >= current_date + 3 months).
-///
-/// Public inputs: `current_date` (YYMMDD as ASCII, verifier checks it matches today).
-/// Output: PredicateOutput with `predicate = true` if passport has >= 3 months validity.
-#[jolt::provable(
-    heap_size = 0x800000,
-    stack_size = 0x80000,
-    max_trace_length = 0x800000,
-    max_output_size = 48,
-    max_untrusted_advice_size = 0x10000
-)]
-fn check_not_expired(
+/// Inner body shared by check_not_expired provable functions.
+fn check_not_expired_inner(
     current_date: [u8; 6],
-    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
-    dg1: jolt::PrivateInput<Vec<u8>>,
+    preparsed_buf: &[u8],
+    dg1: &[u8],
 ) -> PredicateOutput {
     let (
         signed_attrs_der,
@@ -1024,7 +1020,7 @@ fn check_not_expired(
         cert_sig_algo_der,
         csca_spki_der,
         ds_spki_offset,
-    ) = unpack_preparsed(&preparsed_buf);
+    ) = unpack_preparsed(preparsed_buf);
 
     let (valid, mrz, csca_pubkey_hash) = verify_passport_dg1_only(
         signed_attrs_der,
@@ -1038,16 +1034,10 @@ fn check_not_expired(
         cert_sig_algo_der,
         ds_spki_offset,
         csca_spki_der,
-        &dg1,
+        dg1,
     );
 
-    // Compute threshold = current_date + 3 months
     let threshold = add_months(&current_date, 3);
-
-    // Passport is valid if expiry_date >= threshold (i.e. threshold is before or equal to expiry)
-    // Reuse mrz_date_before: predicate = true when threshold <= expiry
-    // mrz_date_before(a, b) = true when a < b, so we check !mrz_date_before(expiry, threshold)
-    // which means expiry >= threshold
     let predicate = !mrz_date_before(&mrz.expiry_date, &threshold);
 
     PredicateOutput {
@@ -1055,4 +1045,75 @@ fn check_not_expired(
         predicate,
         csca_pubkey_hash,
     }
+}
+
+/// ECDSA not-expired predicate — trace length sized for ECDSA P-256 (~6M cycles).
+#[jolt::provable(
+    heap_size = 0x800000,
+    stack_size = 0x80000,
+    max_trace_length = 0x800000,
+    max_output_size = 48,
+    max_untrusted_advice_size = 0x10000
+)]
+fn check_not_expired(
+    current_date: [u8; 6],
+    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
+    dg1: jolt::PrivateInput<Vec<u8>>,
+) -> PredicateOutput {
+    check_not_expired_inner(current_date, &preparsed_buf, &dg1)
+}
+
+// ─── RSA-optimized provable functions ────────────────────────────────────────
+//
+// Same verification logic, but with tighter max_trace_length tuned for
+// RSA-PSS-SHA256 cycle counts. The host selects these when the dataset uses RSA.
+// ECDSA datasets would exceed these trace lengths.
+
+/// RSA pre-parsed variant — trace length 2^23 (~4.5M RSA cycles).
+#[jolt::provable(
+    heap_size = 0x800000,
+    stack_size = 0x40000,
+    max_trace_length = 0x800000,
+    max_output_size = 64,
+    max_untrusted_advice_size = 0x10000
+)]
+fn verify_passport_packed_rsa(
+    disclosure_mask: u8,
+    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
+    dgs: jolt::PrivateInput<PassportDGs>,
+) -> PassportProofOutput {
+    verify_passport_packed_inner(disclosure_mask, &preparsed_buf, &dgs)
+}
+
+/// RSA age predicate — trace length 2^21 (~1.5M RSA cycles).
+#[jolt::provable(
+    heap_size = 0x800000,
+    stack_size = 0x80000,
+    max_trace_length = 0x200000,
+    max_output_size = 48,
+    max_untrusted_advice_size = 0x10000
+)]
+fn check_age_rsa(
+    min_age: u8,
+    current_date: [u8; 6],
+    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
+    dg1: jolt::PrivateInput<Vec<u8>>,
+) -> PredicateOutput {
+    check_age_inner(min_age, current_date, &preparsed_buf, &dg1)
+}
+
+/// RSA not-expired predicate — trace length 2^21 (~1.5M RSA cycles).
+#[jolt::provable(
+    heap_size = 0x800000,
+    stack_size = 0x80000,
+    max_trace_length = 0x200000,
+    max_output_size = 48,
+    max_untrusted_advice_size = 0x10000
+)]
+fn check_not_expired_rsa(
+    current_date: [u8; 6],
+    preparsed_buf: jolt::PrivateInput<Vec<u8>>,
+    dg1: jolt::PrivateInput<Vec<u8>>,
+) -> PredicateOutput {
+    check_not_expired_inner(current_date, &preparsed_buf, &dg1)
 }

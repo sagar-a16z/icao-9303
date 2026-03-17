@@ -36,11 +36,17 @@
 
 - **Host**: `jolt-sdk` with `features = ["host", "zk"]`
 - **Guest**: `jolt-sdk` with `features = ["guest-std", "zk"]`
-- Four provable functions (all auto-detect RSA vs ECDSA from SPKI type):
-  - `verify_passport_packed(mask, PrivateInput<Vec<u8>>, PrivateInput<PassportDGs>)` — host pre-parses SOD/CSCA, guest skips DER parsing
-  - `verify_passport_struct(mask, PrivateInput<PassportData>)` — baseline, guest does full CMS/X.509 parsing
-  - `check_age(min_age, current_date, PrivateInput<...>, PrivateInput<...>)` — DG1-only predicate proof
-  - `check_not_expired(current_date, PrivateInput<...>, PrivateInput<...>)` — DG1-only predicate proof, checks expiry >= current_date + 3 months
+- Seven provable functions — RSA and ECDSA split for optimal trace lengths:
+  - ECDSA variants (trace sized for ECDSA P-256):
+    - `verify_passport_packed(mask, PrivateInput<Vec<u8>>, PrivateInput<PassportDGs>)` — max_trace 2^24
+    - `check_age(min_age, current_date, PrivateInput<...>, PrivateInput<...>)` — max_trace 2^23
+    - `check_not_expired(current_date, PrivateInput<...>, PrivateInput<...>)` — max_trace 2^23
+  - RSA variants (tighter trace lengths):
+    - `verify_passport_packed_rsa(...)` — max_trace 2^23
+    - `check_age_rsa(...)` — max_trace 2^21
+    - `check_not_expired_rsa(...)` — max_trace 2^21
+  - `verify_passport_struct(mask, PrivateInput<PassportData>)` — baseline, max_trace 2^24
+  - Host selects RSA vs ECDSA variant based on dataset key type
 - `pack_preparsed_passport()` extracts byte fields from SOD/CSCA on host, packs with raw DG bytes
 - Guest structural integrity checks: messageDigest ↔ LDS hash, DS SPKI ↔ TBS offset
 - `PassportData` includes `sod`, `dg1-4`, `dg14`, and `csca` (all `Vec<u8>`)
@@ -48,6 +54,16 @@
 - Host passes `PrivateInput::new(...)` — verifier API excludes it automatically
 - BlindFold setup: `prover_prep.blindfold_setup()` → 3-arg `preprocess_verifier_*(shared, verifier_setup, Some(blindfold_setup))`
 - Jolt SDK pinned to commit `97b2c96` (Rust 1.94 update)
+
+## Measured performance (Apple M4 MacBook Pro, single-threaded)
+
+| Variant | RSA trace | RSA time | RSA RAM | ECDSA trace | ECDSA time | ECDSA RAM |
+|---------|-----------|----------|---------|-------------|------------|-----------|
+| **Full disclosure** | 2^23 | ~18s | 7 GB | 2^24 | ~34s | 13 GB |
+| **Age predicate** | 2^21 | ~7s | 3 GB | 2^23 | ~20s | 8 GB |
+| **Not-expired predicate** | 2^21 | ~7s | 3 GB | 2^23 | ~20s | 8 GB |
+
+Proving time and peak memory scale with `max_trace_length`, not actual cycle count.
 
 ## Per-section cycle breakdowns
 
@@ -120,5 +136,6 @@ Note: ~1.7M cycles from postcard deserialization of ~64KB via `PrivateInput` in 
 4. ~~**ECDSA Jacobian + new_unchecked**~~ — Done. 202M → 74M cycles (2.73x improvement).
 5. ~~**p256_fast Solinas reduction**~~ — Done. 74M → 6M cycles (12.3x). Hand-tuned `[u64; 4]` arithmetic with FIPS 186-4 D.2.3 Solinas reduction + Montgomery scalar field.
 6. ~~**Advice-based RSA modexp**~~ — Done. Replaces Montgomery ring_setup+encode+pow_vt with 17 advice-verified modmul steps. RSA age predicate: 2.24M → 1.49M cycles (33.7% reduction). Inspired by [atheonxyz/jolt#6](https://github.com/atheonxyz/jolt/pull/6).
+7. ~~**RSA/ECDSA provable split**~~ — Done. Separate provable functions with tuned max_trace_length. RSA predicates: 2^23 → 2^21 (9 GB → 3 GB, 26s → 7s). RSA packed: 2^24 → 2^23 (13 GB → 7 GB, 51s → 18s).
 
 Note: RSA `analyze` no longer works (advice tape not populated in trace-only mode). Use `analyze --dataset ecdsa` for ECDSA, or run `age`/`packed` directly for RSA cycle counts in prove output.

@@ -19,9 +19,9 @@ Given a passport's NFC chip data (EF.SOD, data groups, CSCA certificate), this l
 
 | Variant | What the verifier learns | Prove time (RSA) | Prove time (ECDSA) |
 |---------|------------------------|-----------------|-------------------|
-| **Full disclosure** | Selected MRZ fields (nationality, DOB, sex, expiry) + CSCA hash | ~17s | ~25s |
-| **Age predicate** | "Holder is >= N years old" + CSCA hash | ~6s | ~15s |
-| **Not-expired predicate** | "Passport valid for >= 3 months" + CSCA hash | ~6s | ~15s |
+| **Full disclosure** | Selected MRZ fields (nationality, DOB, sex, expiry) + CSCA hash | ~18s (7 GB) | ~34s (13 GB) |
+| **Age predicate** | "Holder is >= N years old" + CSCA hash | ~7s (3 GB) | ~20s (8 GB) |
+| **Not-expired predicate** | "Passport valid for >= 3 months" + CSCA hash | ~7s (3 GB) | ~20s (8 GB) |
 
 All passport data (SOD, data groups, CSCA cert) is passed as `PrivateInput` and cryptographically hidden via BlindFold ZK.
 
@@ -74,9 +74,8 @@ RUST_LOG=info cargo run --release -- age --dataset ecdsa
 RUST_LOG=info cargo run --release -- not-expired --dataset ecdsa
 ```
 
-**Cycle analysis (no proving, prints per-section cycle counts):**
+**Cycle analysis (ECDSA only — RSA uses advice-based modexp which requires the prover):**
 ```bash
-RUST_LOG=info cargo run --release -- analyze
 RUST_LOG=info cargo run --release -- analyze --dataset ecdsa
 ```
 
@@ -92,15 +91,17 @@ The passport data is never revealed to the verifier. BlindFold ZK ensures the wi
 
 ## Performance
 
-| Variant | RSA-PSS-SHA256 | ECDSA P-256 |
-|---------|---------------|-------------|
-| **Full disclosure (packed)** | 4.5M cycles (~17s) | 9.3M cycles (~25s) |
-| **Age predicate** | 1.5M cycles (~6s) | 6.0M cycles (~15s) |
-| **Not-expired predicate** | ~1.5M cycles (~6s) | ~6.0M cycles (~15s) |
+RSA and ECDSA use separate provable functions with tuned `max_trace_length` — proving time and peak memory scale with this parameter, not cycle count.
 
-Prove times measured on Apple M-series, single-threaded. Full disclosure requires ~15 GB RAM; predicates require <10 GB.
+| Variant | RSA cycles | RSA trace | RSA time / RAM | ECDSA cycles | ECDSA trace | ECDSA time / RAM |
+|---------|-----------|-----------|---------------|-------------|------------|-----------------|
+| **Full disclosure** | 4.5M | 2^23 | ~18s / 7 GB | 9.3M | 2^24 | ~34s / 13 GB |
+| **Age predicate** | 1.5M | 2^21 | ~7s / 3 GB | 6.0M | 2^23 | ~20s / 8 GB |
+| **Not-expired predicate** | ~1.5M | 2^21 | ~7s / 3 GB | ~6.0M | 2^23 | ~20s / 8 GB |
 
-Predicate proofs are ~57% cheaper than full disclosure because they only hash DG1 (93 bytes) instead of all 5 data groups (~64 KB).
+Prove times measured on Apple M4 MacBook Pro, single-threaded. Preprocessing (compile + setup) runs once and is not included.
+
+Predicate proofs are cheaper than full disclosure because they only hash DG1 (93 bytes) instead of all 5 data groups (~64 KB). RSA predicates are additionally cheaper because advice-based modexp keeps cycle count well below 2^21.
 
 ## Architecture
 
@@ -111,11 +112,12 @@ icao-9303/                    Rust library: ASN.1 parsing, crypto, NFC protocols
   src/emrtd/                  BAC, Secure Messaging, Chip Authentication, PACE
 
 icao-9303-jolt/               Jolt ZK proof wrapper
-  guest/src/lib.rs            RISC-V guest: 4 provable functions
+  guest/src/lib.rs            RISC-V guest: 7 provable functions (RSA + ECDSA splits)
+  guest/src/bignum.rs         Wide multiplication for advice-based RSA verification
   src/main.rs                 Host: compile, prove, verify
 ```
 
-The ZK guest auto-detects RSA vs ECDSA from the public key type — a single set of provable functions handles both.
+The ZK guest auto-detects RSA vs ECDSA from the public key type. RSA and ECDSA have separate provable functions with tuned `max_trace_length` for optimal memory usage; the host selects the right one based on the dataset's key type.
 
 ### Why custom crypto?
 

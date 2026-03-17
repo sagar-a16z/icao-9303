@@ -14,20 +14,37 @@ pub fn main() {
     let mask: u8 = DISCLOSE_NATIONALITY | DISCLOSE_DOB | DISCLOSE_SEX | DISCLOSE_EXPIRY;
 
     let variant = std::env::args().nth(1).unwrap_or_else(|| "packed".into());
-    // Optional: --dataset synth (default) or --dataset ecdsa
     let dataset = parse_dataset_arg();
 
     // ── Load passport data from disk ─────────────────────────────────────
     let (sod, dg1, dg2, dg3, dg4, dg14, csca) = load_dataset(&dataset);
+    let is_rsa = dataset != "ecdsa";
 
     match variant.as_str() {
-        "packed" => run_packed(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca),
+        "packed" => {
+            if is_rsa {
+                run_packed_rsa(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca);
+            } else {
+                run_packed(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca);
+            }
+        }
         "struct" => run_struct(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca),
-        "age" => run_age_check(&sod, &dg1, &csca),
-        "not-expired" => run_not_expired_check(&sod, &dg1, &csca),
+        "age" => {
+            if is_rsa {
+                run_age_check_rsa(&sod, &dg1, &csca);
+            } else {
+                run_age_check(&sod, &dg1, &csca);
+            }
+        }
+        "not-expired" => {
+            if is_rsa {
+                run_not_expired_check_rsa(&sod, &dg1, &csca);
+            } else {
+                run_not_expired_check(&sod, &dg1, &csca);
+            }
+        }
         "analyze" => {
             if dataset == "ecdsa" {
-                // ECDSA doesn't use advice functions, so analyze works
                 info!("═══ PACKED (pre-parsed) ═══");
                 analyze_packed(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca);
                 info!("");
@@ -111,7 +128,7 @@ fn load_dataset(
     }
 }
 
-// ─── Analyze (cycle counting) ────────────────────────────────────────────────
+// ─── Analyze (cycle counting, ECDSA only) ────────────────────────────────────
 
 fn analyze_packed(
     mask: u8,
@@ -187,7 +204,7 @@ fn analyze_not_expired(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     info!("Written to summary-not-expired.txt");
 }
 
-// ─── Prove + verify ──────────────────────────────────────────────────────────
+// ─── Prove + verify (ECDSA variants, max_trace_length = 2^24 / 2^23) ────────
 
 fn run_packed(
     mask: u8,
@@ -218,43 +235,9 @@ fn run_packed(
     let prove = guest::build_prover_verify_passport_packed(program, prover_prep);
     let verify = guest::build_verifier_verify_passport_packed(verifier_prep);
 
-    info!("Proving (packed, mask=0x{mask:02x})...");
+    info!("Proving (packed ECDSA, mask=0x{mask:02x}, trace=2^24)...");
     let t = Instant::now();
     let (output, proof, io) = prove(mask, PrivateInput::new(buf), PrivateInput::new(dgs));
-    info!("Prover runtime: {:.2}s", t.elapsed().as_secs_f64());
-
-    let is_valid = verify(mask, output.clone(), io.panic, proof);
-    print_disclosure_result(&output, is_valid, &io);
-}
-
-fn run_struct(
-    mask: u8,
-    sod: &[u8],
-    dg1: &[u8],
-    dg2: &[u8],
-    dg3: &[u8],
-    dg4: &[u8],
-    dg14: &[u8],
-    csca: &[u8],
-) {
-    let passport = make_passport(sod, dg1, dg2, dg3, dg4, dg14, csca);
-
-    let target_dir = "/tmp/jolt-guest-targets";
-    let mut program = guest::compile_verify_passport_struct(target_dir);
-    let shared = guest::preprocess_shared_verify_passport_struct(&mut program);
-    let prover_prep = guest::preprocess_prover_verify_passport_struct(shared.clone());
-    let blindfold_setup = prover_prep.blindfold_setup();
-    let verifier_prep = guest::preprocess_verifier_verify_passport_struct(
-        shared,
-        prover_prep.generators.to_verifier_setup(),
-        Some(blindfold_setup),
-    );
-    let prove = guest::build_prover_verify_passport_struct(program, prover_prep);
-    let verify = guest::build_verifier_verify_passport_struct(verifier_prep);
-
-    info!("Proving (struct, mask=0x{mask:02x})...");
-    let t = Instant::now();
-    let (output, proof, io) = prove(mask, PrivateInput::new(passport));
     info!("Prover runtime: {:.2}s", t.elapsed().as_secs_f64());
 
     let is_valid = verify(mask, output.clone(), io.panic, proof);
@@ -280,7 +263,7 @@ fn run_age_check(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     let verify = guest::build_verifier_check_age(verifier_prep);
 
     info!(
-        "Proving (age check, min_age={min_age}, date={})...",
+        "Proving (age check ECDSA, min_age={min_age}, date={}, trace=2^23)...",
         std::str::from_utf8(&current_date).unwrap()
     );
     let t = Instant::now();
@@ -314,7 +297,7 @@ fn run_not_expired_check(sod: &[u8], dg1: &[u8], csca: &[u8]) {
     let verify = guest::build_verifier_check_not_expired(verifier_prep);
 
     info!(
-        "Proving (not-expired check, date={}, +3mo)...",
+        "Proving (not-expired check ECDSA, date={}, +3mo, trace=2^23)...",
         std::str::from_utf8(&current_date).unwrap()
     );
     let t = Instant::now();
@@ -327,6 +310,150 @@ fn run_not_expired_check(sod: &[u8], dg1: &[u8], csca: &[u8]) {
 
     let is_valid = verify(current_date, output.clone(), io.panic, proof);
     print_predicate_result("Not expired (+3mo)", &output, is_valid, &io);
+}
+
+// ─── Prove + verify (RSA variants, tighter trace lengths) ────────────────────
+
+fn run_packed_rsa(
+    mask: u8,
+    sod: &[u8],
+    dg1: &[u8],
+    dg2: &[u8],
+    dg3: &[u8],
+    dg4: &[u8],
+    dg14: &[u8],
+    csca: &[u8],
+) {
+    let (buf, dgs) = pack_preparsed_passport(sod, dg1, dg2, dg3, dg4, dg14, csca);
+    info!(
+        "Pre-parsed buffer: {} bytes (+ DGs as separate struct)",
+        buf.len()
+    );
+
+    let target_dir = "/tmp/jolt-guest-targets";
+    let mut program = guest::compile_verify_passport_packed_rsa(target_dir);
+    let shared = guest::preprocess_shared_verify_passport_packed_rsa(&mut program);
+    let prover_prep = guest::preprocess_prover_verify_passport_packed_rsa(shared.clone());
+    let blindfold_setup = prover_prep.blindfold_setup();
+    let verifier_prep = guest::preprocess_verifier_verify_passport_packed_rsa(
+        shared,
+        prover_prep.generators.to_verifier_setup(),
+        Some(blindfold_setup),
+    );
+    let prove = guest::build_prover_verify_passport_packed_rsa(program, prover_prep);
+    let verify = guest::build_verifier_verify_passport_packed_rsa(verifier_prep);
+
+    info!("Proving (packed RSA, mask=0x{mask:02x}, trace=2^23)...");
+    let t = Instant::now();
+    let (output, proof, io) = prove(mask, PrivateInput::new(buf), PrivateInput::new(dgs));
+    info!("Prover runtime: {:.2}s", t.elapsed().as_secs_f64());
+
+    let is_valid = verify(mask, output.clone(), io.panic, proof);
+    print_disclosure_result(&output, is_valid, &io);
+}
+
+fn run_age_check_rsa(sod: &[u8], dg1: &[u8], csca: &[u8]) {
+    let (buf, _) = pack_preparsed_passport(sod, dg1, &[], &[], &[], &[], csca);
+    let current_date: [u8; 6] = *b"260312";
+    let min_age: u8 = 18;
+
+    let target_dir = "/tmp/jolt-guest-targets";
+    let mut program = guest::compile_check_age_rsa(target_dir);
+    let shared = guest::preprocess_shared_check_age_rsa(&mut program);
+    let prover_prep = guest::preprocess_prover_check_age_rsa(shared.clone());
+    let blindfold_setup = prover_prep.blindfold_setup();
+    let verifier_prep = guest::preprocess_verifier_check_age_rsa(
+        shared,
+        prover_prep.generators.to_verifier_setup(),
+        Some(blindfold_setup),
+    );
+    let prove = guest::build_prover_check_age_rsa(program, prover_prep);
+    let verify = guest::build_verifier_check_age_rsa(verifier_prep);
+
+    info!(
+        "Proving (age check RSA, min_age={min_age}, date={}, trace=2^21)...",
+        std::str::from_utf8(&current_date).unwrap()
+    );
+    let t = Instant::now();
+    let (output, proof, io) = prove(
+        min_age,
+        current_date,
+        PrivateInput::new(buf),
+        PrivateInput::new(dg1.to_vec()),
+    );
+    info!("Prover runtime: {:.2}s", t.elapsed().as_secs_f64());
+
+    let is_valid = verify(min_age, current_date, output.clone(), io.panic, proof);
+    print_predicate_result("Age >= 18", &output, is_valid, &io);
+}
+
+fn run_not_expired_check_rsa(sod: &[u8], dg1: &[u8], csca: &[u8]) {
+    let (buf, _) = pack_preparsed_passport(sod, dg1, &[], &[], &[], &[], csca);
+    let current_date: [u8; 6] = *b"260313";
+
+    let target_dir = "/tmp/jolt-guest-targets";
+    let mut program = guest::compile_check_not_expired_rsa(target_dir);
+    let shared = guest::preprocess_shared_check_not_expired_rsa(&mut program);
+    let prover_prep = guest::preprocess_prover_check_not_expired_rsa(shared.clone());
+    let blindfold_setup = prover_prep.blindfold_setup();
+    let verifier_prep = guest::preprocess_verifier_check_not_expired_rsa(
+        shared,
+        prover_prep.generators.to_verifier_setup(),
+        Some(blindfold_setup),
+    );
+    let prove = guest::build_prover_check_not_expired_rsa(program, prover_prep);
+    let verify = guest::build_verifier_check_not_expired_rsa(verifier_prep);
+
+    info!(
+        "Proving (not-expired check RSA, date={}, +3mo, trace=2^21)...",
+        std::str::from_utf8(&current_date).unwrap()
+    );
+    let t = Instant::now();
+    let (output, proof, io) = prove(
+        current_date,
+        PrivateInput::new(buf),
+        PrivateInput::new(dg1.to_vec()),
+    );
+    info!("Prover runtime: {:.2}s", t.elapsed().as_secs_f64());
+
+    let is_valid = verify(current_date, output.clone(), io.panic, proof);
+    print_predicate_result("Not expired (+3mo)", &output, is_valid, &io);
+}
+
+// ─── Baseline (struct variant, not split by key type) ────────────────────────
+
+fn run_struct(
+    mask: u8,
+    sod: &[u8],
+    dg1: &[u8],
+    dg2: &[u8],
+    dg3: &[u8],
+    dg4: &[u8],
+    dg14: &[u8],
+    csca: &[u8],
+) {
+    let passport = make_passport(sod, dg1, dg2, dg3, dg4, dg14, csca);
+
+    let target_dir = "/tmp/jolt-guest-targets";
+    let mut program = guest::compile_verify_passport_struct(target_dir);
+    let shared = guest::preprocess_shared_verify_passport_struct(&mut program);
+    let prover_prep = guest::preprocess_prover_verify_passport_struct(shared.clone());
+    let blindfold_setup = prover_prep.blindfold_setup();
+    let verifier_prep = guest::preprocess_verifier_verify_passport_struct(
+        shared,
+        prover_prep.generators.to_verifier_setup(),
+        Some(blindfold_setup),
+    );
+    let prove = guest::build_prover_verify_passport_struct(program, prover_prep);
+    let verify = guest::build_verifier_verify_passport_struct(verifier_prep);
+
+    info!("Proving (struct, mask=0x{mask:02x})...");
+    let t = Instant::now();
+    let (output, proof, io) = prove(mask, PrivateInput::new(passport));
+    info!("Prover runtime: {:.2}s", t.elapsed().as_secs_f64());
+
+    let is_valid = verify(mask, output.clone(), io.panic, proof);
+    print_disclosure_result(&output, is_valid, &io);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
