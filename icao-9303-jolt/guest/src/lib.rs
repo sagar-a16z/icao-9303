@@ -1,3 +1,5 @@
+mod bignum;
+
 use cms::cert::CertificateChoices;
 use der::{asn1::OctetString, Decode, Encode};
 use icao_9303::{
@@ -6,7 +8,7 @@ use icao_9303::{
         public_key_info::SubjectPublicKeyInfo,
         DigestAlgorithmIdentifier, SignatureAlgorithmIdentifier,
     },
-    crypto::{mod_ring::RingRefExt, p256_fast::verify_ecdsa_p256_fast, rsa::RSAPublicKey},
+    crypto::p256_fast::verify_ecdsa_p256_fast,
 };
 use jolt::{end_cycle_tracking, start_cycle_tracking};
 use ruint::Uint;
@@ -732,6 +734,73 @@ fn verify_passport_dg1_only(
     (valid, mrz, csca_pubkey_hash)
 }
 
+// ─── Advice-based RSA modular exponentiation ─────────────────────────────────
+//
+// Instead of computing Montgomery modexp in-guest (~937K cycles per RSA-2048 sig),
+// the host provides (quotient, remainder) for each modmul step via advice.
+// The guest verifies: a*b == q*n + r AND r < n.
+// For e=65537: 16 squarings + 1 multiply = 17 verification steps.
+
+/// Advice function: compute (quotient, remainder) of a*b divided by n.
+/// Body runs only during the compute_advice pass (host emulation).
+/// During proving, the result is read from the advice tape.
+#[jolt::advice]
+fn modmul_2048_step(
+    a: [u64; 32],
+    b: [u64; 32],
+    n: [u64; 32],
+) -> jolt::UntrustedAdvice<([u64; 32], [u64; 32])> {
+    // Widen to 4096 bits for the multiplication (product fits in 4096 bits)
+    type U4096 = Uint<4096, 64>;
+    let a_wide = U4096::from_limbs({
+        let mut l = [0u64; 64];
+        l[..32].copy_from_slice(&a);
+        l
+    });
+    let b_wide = U4096::from_limbs({
+        let mut l = [0u64; 64];
+        l[..32].copy_from_slice(&b);
+        l
+    });
+    let n_wide = U4096::from_limbs({
+        let mut l = [0u64; 64];
+        l[..32].copy_from_slice(&n);
+        l
+    });
+
+    let product = a_wide * b_wide;
+    let q = product / n_wide;
+    let r = product % n_wide;
+
+    let mut q_limbs = [0u64; 32];
+    q_limbs.copy_from_slice(&q.as_limbs()[..32]);
+    let mut r_limbs = [0u64; 32];
+    r_limbs.copy_from_slice(&r.as_limbs()[..32]);
+
+    (q_limbs, r_limbs)
+}
+
+/// Advice-based modular exponentiation: sig^65537 mod n.
+/// 16 squarings + 1 multiply, each verified via check_advice.
+fn rsa_modexp_2048_advice(sig_limbs: &[u64; 32], n_limbs: &[u64; 32]) -> [u64; 32] {
+    let mut current = *sig_limbs;
+
+    // 16 squarings: sig -> sig^2 -> sig^4 -> ... -> sig^(2^16)
+    for _ in 0..16 {
+        let (q, r) = *modmul_2048_step(current, current, *n_limbs);
+        jolt::check_advice!(bignum::verify_modsquare(&current, &q, n_limbs, &r));
+        jolt::check_advice!(bignum::lt(&r, n_limbs));
+        current = r;
+    }
+
+    // Final multiply: sig^(2^16) * sig = sig^(2^16 + 1) = sig^65537
+    let (q, r) = *modmul_2048_step(current, *sig_limbs, *n_limbs);
+    jolt::check_advice!(bignum::verify_modmul(&current, sig_limbs, &q, n_limbs, &r));
+    jolt::check_advice!(bignum::lt(&r, n_limbs));
+
+    r
+}
+
 /// Verify a signature using the appropriate algorithm (RSA-PSS or ECDSA P-256)
 /// based on the public key type.
 fn verify_signature(
@@ -741,19 +810,30 @@ fn verify_signature(
     message_hash: &[u8],
 ) -> bool {
     match spki {
-        SubjectPublicKeyInfo::Rsa(_) => {
-            start_cycle_tracking("ring_setup");
-            let rsa_key = RSAPublicKey::<Uint2048>::try_from(spki.clone()).unwrap();
-            end_cycle_tracking("ring_setup");
+        SubjectPublicKeyInfo::Rsa(key) => {
+            // Advice-based RSA: modexp via host advice, PSS verified in guest
+            start_cycle_tracking("rsa_advice_modexp");
+            let modulus = Uint2048::try_from(key.modulus.clone()).unwrap();
+            let sig_uint = Uint2048::from_be_slice(signature_bytes);
+            let n_limbs = *modulus.as_limbs();
+            let sig_limbs = *sig_uint.as_limbs();
+            let em_limbs = rsa_modexp_2048_advice(&sig_limbs, &n_limbs);
+            end_cycle_tracking("rsa_advice_modexp");
 
-            start_cycle_tracking("mont_encode");
-            let sig_elem = rsa_key.ring.from(Uint2048::from_be_slice(signature_bytes));
-            let msg_elem = rsa_key.ring.from(Uint2048::from_be_slice(message_hash));
-            end_cycle_tracking("mont_encode");
-
-            start_cycle_tracking("rsa_verify");
-            let valid = rsa_key.verify(msg_elem, sig_elem, sig_algo).is_ok();
-            end_cycle_tracking("rsa_verify");
+            start_cycle_tracking("rsa_pss_verify");
+            let pss_params = match sig_algo {
+                SignatureAlgorithmIdentifier::RsaPss(p) => p,
+                _ => panic!("expected RSA-PSS"),
+            };
+            let em_uint = Uint2048::from_limbs(em_limbs);
+            let valid = icao_9303::crypto::rsa::verify_pss_em(
+                &em_uint.to_be_bytes_vec(),
+                message_hash,
+                pss_params,
+                modulus.bit_len(),
+            )
+            .is_ok();
+            end_cycle_tracking("rsa_pss_verify");
             valid
         }
         SubjectPublicKeyInfo::Ec(ec) => {

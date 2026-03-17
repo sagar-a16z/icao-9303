@@ -21,9 +21,11 @@
 - Full ASN.1/DER/CMS parsing: `EfSod`, `LdsSecurityObject`, `EfDg14`, `EfCom`
 - `DigestAlgorithmIdentifier::hash_bytes()` / `hash_der()` — SHA-1/256/384/512
 - `RSAPublicKey::verify()` — RFC 8017 RSA-PSS with constant-time and variable-time exponentiation
+- `verify_pss_em()` — standalone PSS padding verification (used by advice-based RSA path)
 - `ModRing` Montgomery arithmetic over generic `Uint<B,L>`
 - `MrzRaw` — fixed-size byte array MRZ parser for ZK guest use
 - BAC, Secure Messaging (3DES + AES), Chip Authentication skeleton, PACE key derivation
+- **Advice-based RSA modexp** — guest/src/bignum.rs provides wide multiply + squaring verification; host provides (quotient, remainder) via `#[jolt::advice]`; guest verifies `a*b == q*n + r` for each of 17 steps (e=65537)
 
 ### Missing
 - **RSA-4096 in ZK guest** — library supports 4096-bit RSA, not yet wired into Jolt guest
@@ -49,21 +51,21 @@
 
 ## Per-section cycle breakdowns
 
-**RSA packed (5.3M cycles):**
+**RSA age predicate (1.49M cycles, advice-based modexp):**
 
 | Section | Cycles | % |
 |---------|--------|---|
-| `dg_hash_verify` (5 DGs) | 2,800,236 | 52.9% |
-| `rsa_verify` (cert chain) | 789,545 | 14.9% |
-| `rsa_verify` (SOD) | 767,029 | 14.5% |
-| `ring_setup` (×2) | 213,563 | 4.0% |
-| `mont_encode` (×2) | 122,760 | 2.3% |
-| `parse_lds` | 42,155 | 0.8% |
-| `structural_checks` | 26,589 | 0.5% |
-| `hash_signed_attrs` | 21,198 | 0.4% |
-| `csca_hash` | 17,817 | 0.3% |
-| `mrz_parse` | 421 | ~0% |
-| serde + overhead | ~490,000 | 9.3% |
+| `rsa_advice_modexp` (SOD) | 461,162 | 31.0% |
+| `rsa_advice_modexp` (cert chain) | 460,787 | 31.0% |
+| `rsa_pss_verify` (cert chain) | 119,849 | 8.1% |
+| `rsa_pss_verify` (SOD) | 93,335 | 6.3% |
+| `parse_lds` | 41,189 | 2.8% |
+| `structural_checks` | 26,547 | 1.8% |
+| `hash_signed_attrs` | 20,478 | 1.4% |
+| `csca_hash` | 18,041 | 1.2% |
+| `dg_hash_verify` (DG1 only) | 8,309 | 0.6% |
+| `mrz_parse` | 1,044 | 0.1% |
+| serde + overhead | ~237,000 | 15.9% |
 
 **ECDSA packed (9.3M cycles):**
 
@@ -112,8 +114,11 @@ Note: ~1.7M cycles from postcard deserialization of ~64KB via `PrivateInput` in 
 6. Fuzz `p256_reduce()`, `verify_pss()`, `EcdsaSignature::from_der()`
 
 ## Optimization opportunities
-1. **Zerocopy `PrivateInput`** — ~1.7M cycles (24%). Jolt SDK's `#[jolt::provable]` macro always uses postcard serde for `PrivateInput<T>`, even though `AdviceTapeIO` trait exists with bytemuck zero-copy. Requires upstream jolt-sdk PR to use `AdviceTapeIO` when available.
+1. **Zerocopy `PrivateInput`** — ~1.7M cycles (24% of full disclosure). Jolt SDK's `#[jolt::provable]` macro always uses postcard serde for `PrivateInput<T>`, even though `AdviceTapeIO` trait exists with bytemuck zero-copy. Requires upstream jolt-sdk PR to use `AdviceTapeIO` when available.
 2. **`jolt-inlines-p256`** — would reduce ECDSA from ~6M to ~500K cycles. Requires upstream Jolt SDK work to add P-256 as a native instruction set (similar to existing `jolt-inlines-secp256k1` for Bitcoin's curve).
 3. ~~**DER parsing offload**~~ — Done. Host pre-parses SOD/CSCA, saving ~450K cycles (5.9%).
-4. ~~**ECDSA Jacobian + new_unchecked**~~ — Done. 202M -> 74M cycles (2.73x improvement).
-5. ~~**p256_fast Solinas reduction**~~ — Done. 74M -> 6M cycles (12.3x). Hand-tuned `[u64; 4]` arithmetic with FIPS 186-4 D.2.3 Solinas reduction + Montgomery scalar field.
+4. ~~**ECDSA Jacobian + new_unchecked**~~ — Done. 202M → 74M cycles (2.73x improvement).
+5. ~~**p256_fast Solinas reduction**~~ — Done. 74M → 6M cycles (12.3x). Hand-tuned `[u64; 4]` arithmetic with FIPS 186-4 D.2.3 Solinas reduction + Montgomery scalar field.
+6. ~~**Advice-based RSA modexp**~~ — Done. Replaces Montgomery ring_setup+encode+pow_vt with 17 advice-verified modmul steps. RSA age predicate: 2.24M → 1.49M cycles (33.7% reduction). Inspired by [atheonxyz/jolt#6](https://github.com/atheonxyz/jolt/pull/6).
+
+Note: RSA `analyze` no longer works (advice tape not populated in trace-only mode). Use `analyze --dataset ecdsa` for ECDSA, or run `age`/`packed` directly for RSA cycle counts in prove output.

@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 guest = []
+compute_advice = []
 
 [dependencies]
 jolt      = { package = "jolt-sdk", git = "https://github.com/a16z/jolt", features = ["guest-std", "zk"] }

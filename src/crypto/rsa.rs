@@ -44,96 +44,108 @@ impl<U: UintMont> RSAPublicKey<U> {
         signature: ModRingElementRef<'s, U>,
         params: &RsaPssParameters,
     ) -> Result<()> {
-        // Verifies h == h', where,
-        // EM (expected message) = signature^e mod n
-        // EM:  DB masked || h || 0xBC
-        // DB (data block): padding |∣ 0x01 |∣ salt
-        // DB masked = DB xor MFG(h)
-        // h' = hash(padding || hash(message) || salt)
-
         ensure!(signature.ring() == &self.ring);
         ensure!(message.ring() == &self.ring);
 
-        let ring_bit_len = self.ring.modulus().bit_len();
-        let digest_algo = &params.hash_algorithm;
-        let salt_len = params.salt_length.as_bytes()[0] as usize;
-        let trailer_field = params.trailer_field.as_bytes()[0] as usize;
-        ensure!(
-            trailer_field == 1,
-            "Unrecognized trailer field {trailer_field}. Expected value 1 (= 0xbc)"
-        );
-
+        // Compute EM = signature^e mod n
         #[cfg(feature = "constant-time")]
         let em_elem = signature.pow_ct(self.public_exponent);
         #[cfg(not(feature = "constant-time"))]
         let em_elem = signature.pow_vt(self.public_exponent);
         let em_bytes = em_elem.to_uint().to_be_bytes();
-        let em_len = (self.ring.modulus().bit_len() + 7) / 8;
 
-        // Check trailer (0xBC byte)
-        ensure!(
-            *em_bytes.last().unwrap_or(&0) == 0xbc,
-            "Invalid PSS trailer byte"
-        );
-
-        // Split DB/H from EM
-        let hash_len = digest_algo.hash_bytes(&[]).len();
-        ensure!(
-            em_len >= hash_len + salt_len + 2,
-            "Encoded message too short for PSS"
-        );
-
-        let db_len = em_len - hash_len - 1;
-        let db = &em_bytes[..db_len];
-        let h = &em_bytes[db_len..db_len + hash_len];
-
-        // MGF1 unmask
-        let mgf_mask = match &params.mask_gen_algorithm {
-            MaskGenAlgorithm::Mgf1(mgf1_da) => mgf1(mgf1_da, h, db_len),
-            _ => bail!("Unrecognized MaskGenAlgorithm. Only MGF1 supported"),
-        };
-        let mut db_unmasked = vec![0u8; db_len];
-        for (i, &b) in db.iter().enumerate() {
-            db_unmasked[i] = b ^ mgf_mask[i];
-        }
-        let em_bits = ring_bit_len - 1;
-        db_unmasked[0] &= 0xff >> (8 * em_len - em_bits);
-
-        // Verify DB format
-        let salt_start = db_len - salt_len;
-        let mut one = None;
-        for i in (0..salt_start).rev() {
-            if db_unmasked[i] == 0x01 {
-                one = Some(i);
-                break;
-            } else if db_unmasked[i] != 0x00 {
-                break;
-            }
-        }
-        let one_pos = one.ok_or_else(|| anyhow!("DB format mismatch: missing 0x01"))?;
-
-        // Verify all bytes before 0x01 are 0x00
-        ensure!(
-            db_unmasked[..one_pos].iter().all(|&b| b == 0),
-            "DB format mismatch: invalid padding"
-        );
-
-        // Recovered salt
-        let salt = &db_unmasked[one_pos + 1..];
-        ensure!(salt.len() == salt_len, "Salt length mismatch");
-
-        // Compute h' = hash(padding || hash(message) || salt)
+        // Extract raw message hash from the ring element
+        let hash_len = params.hash_algorithm.hash_bytes(&[]).len();
         let message_bytes = message.to_uint().to_be_bytes();
+        let message_hash = &message_bytes[message_bytes.len() - hash_len..];
 
-        let mut pre_data = vec![0u8; 8]; // 8‐byte zero prefix
-        pre_data.extend_from_slice(&message_bytes[message_bytes.len() - hash_len..]);
-        pre_data.extend_from_slice(salt);
-        let h_prime = digest_algo.hash_bytes(&pre_data);
-
-        ensure!(h_prime == h, "PSS verification: hash check failed");
-
-        Ok(())
+        verify_pss_em(&em_bytes, message_hash, params, self.ring.modulus().bit_len())
     }
+}
+
+/// Verify RSA-PSS padding on a pre-computed EM block (sig^e mod n).
+///
+/// This is the PSS verification logic separated from the modular exponentiation,
+/// allowing callers to compute sig^e mod n by any means (e.g. advice-based modexp)
+/// and then verify the PSS padding here.
+///
+/// - `em_bytes`: big-endian representation of sig^e mod n (full modulus width)
+/// - `message_hash`: the raw hash of the message being verified (e.g. 32 bytes for SHA-256)
+/// - `params`: RSA-PSS parameters (hash algo, MGF, salt length, trailer field)
+/// - `modulus_bit_len`: bit length of the RSA modulus (for bit masking)
+pub fn verify_pss_em(
+    em_bytes: &[u8],
+    message_hash: &[u8],
+    params: &RsaPssParameters,
+    modulus_bit_len: usize,
+) -> Result<()> {
+    let digest_algo = &params.hash_algorithm;
+    let salt_len = params.salt_length.as_bytes()[0] as usize;
+    let trailer_field = params.trailer_field.as_bytes()[0] as usize;
+    ensure!(
+        trailer_field == 1,
+        "Unrecognized trailer field {trailer_field}. Expected value 1 (= 0xbc)"
+    );
+
+    let em_len = (modulus_bit_len + 7) / 8;
+
+    ensure!(
+        *em_bytes.last().unwrap_or(&0) == 0xbc,
+        "Invalid PSS trailer byte"
+    );
+
+    let hash_len = digest_algo.hash_bytes(&[]).len();
+    ensure!(
+        em_len >= hash_len + salt_len + 2,
+        "Encoded message too short for PSS"
+    );
+
+    let db_len = em_len - hash_len - 1;
+    let db = &em_bytes[..db_len];
+    let h = &em_bytes[db_len..db_len + hash_len];
+
+    // MGF1 unmask
+    let mgf_mask = match &params.mask_gen_algorithm {
+        MaskGenAlgorithm::Mgf1(mgf1_da) => mgf1(mgf1_da, h, db_len),
+        _ => bail!("Unrecognized MaskGenAlgorithm. Only MGF1 supported"),
+    };
+    let mut db_unmasked = vec![0u8; db_len];
+    for (i, &b) in db.iter().enumerate() {
+        db_unmasked[i] = b ^ mgf_mask[i];
+    }
+    let em_bits = modulus_bit_len - 1;
+    db_unmasked[0] &= 0xff >> (8 * em_len - em_bits);
+
+    // Verify DB format
+    let salt_start = db_len - salt_len;
+    let mut one = None;
+    for i in (0..salt_start).rev() {
+        if db_unmasked[i] == 0x01 {
+            one = Some(i);
+            break;
+        } else if db_unmasked[i] != 0x00 {
+            break;
+        }
+    }
+    let one_pos = one.ok_or_else(|| anyhow!("DB format mismatch: missing 0x01"))?;
+
+    ensure!(
+        db_unmasked[..one_pos].iter().all(|&b| b == 0),
+        "DB format mismatch: invalid padding"
+    );
+
+    let salt = &db_unmasked[one_pos + 1..];
+    ensure!(salt.len() == salt_len, "Salt length mismatch");
+
+    // Compute h' = hash(padding || message_hash || salt)
+    let mut pre_data = vec![0u8; 8]; // 8-byte zero prefix
+    pre_data.extend_from_slice(message_hash);
+    pre_data.extend_from_slice(salt);
+    let h_prime = digest_algo.hash_bytes(&pre_data);
+
+    ensure!(h_prime == h, "PSS verification: hash check failed");
+
+    Ok(())
 }
 
 fn mgf1(digest_algo: &DigestAlgorithmIdentifier, seed: &[u8], out_len: usize) -> Vec<u8> {

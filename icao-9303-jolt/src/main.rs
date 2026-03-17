@@ -26,17 +26,24 @@ pub fn main() {
         "age" => run_age_check(&sod, &dg1, &csca),
         "not-expired" => run_not_expired_check(&sod, &dg1, &csca),
         "analyze" => {
-            info!("═══ PACKED (pre-parsed) ═══");
-            analyze_packed(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca);
-            info!("");
-            info!("═══ STRUCT (baseline) ═══");
-            analyze_struct(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca);
-            info!("");
-            info!("═══ AGE CHECK ═══");
-            analyze_age(&sod, &dg1, &csca);
-            info!("");
-            info!("═══ NOT-EXPIRED CHECK ═══");
-            analyze_not_expired(&sod, &dg1, &csca);
+            if dataset == "ecdsa" {
+                // ECDSA doesn't use advice functions, so analyze works
+                info!("═══ PACKED (pre-parsed) ═══");
+                analyze_packed(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca);
+                info!("");
+                info!("═══ STRUCT (baseline) ═══");
+                analyze_struct(mask, &sod, &dg1, &dg2, &dg3, &dg4, &dg14, &csca);
+                info!("");
+                info!("═══ AGE CHECK ═══");
+                analyze_age(&sod, &dg1, &csca);
+                info!("");
+                info!("═══ NOT-EXPIRED CHECK ═══");
+                analyze_not_expired(&sod, &dg1, &csca);
+            } else {
+                info!("RSA variants use advice-based modexp — analyze not supported.");
+                info!("Use 'analyze --dataset ecdsa' for ECDSA cycle counts,");
+                info!("or run 'age'/'packed' directly to see cycle counts in prove output.");
+            }
         }
         other => {
             eprintln!("Unknown variant '{other}'.");
